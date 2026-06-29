@@ -2,7 +2,12 @@ module github.com/zipkero/langgraph-go
 
 go 1.26.4
 
-require github.com/anthropics/anthropic-sdk-go v1.52.0
+require (
+	github.com/anthropics/anthropic-sdk-go v1.52.0
+	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
+	github.com/nguyenthenguyen/docx v0.0.0-20230621112118-9c8e795a11db
+	golang.org/x/net v0.56.0
+)
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
