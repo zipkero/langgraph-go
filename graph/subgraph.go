@@ -26,6 +26,10 @@ type subgraphResult struct {
 	state State
 	// parentCmd 가 nil이 아니면 이 명령을 부모 루프로 전달한다.
 	parentCmd *command.Command
+	// updates 는 Fanout 분기 실행 중 각 노드가 반환한 원본 업데이트 목록이다.
+	// invokeSubgraphFromNodeCollect 가 채워 반환하며, 호출자가 순서대로
+	// applyReducers 로 적용해야 이중 누적 없이 병합된다(ANALYSIS §2.2).
+	updates []StateUpdate
 }
 
 // invokeSubgraph 는 서브그래프 전용 실행 루프다.
@@ -105,17 +109,18 @@ func invokeSubgraph(ctx context.Context, compiled *Compiled, input State, cfg co
 		// Fanout 처리 (current-graph 대상만)
 		if len(next.sends) > 0 {
 			for _, se := range next.sends {
-				branchResult, branchErr := invokeSubgraphFromNode(ctx, compiled, se.target, se.state, step+1, cfg)
+				br, branchErr := invokeSubgraphFromNodeCollect(ctx, compiled, se.target, se.state, step+1, cfg)
 				if branchErr != nil {
 					return subgraphResult{}, fmt.Errorf("graph: 서브그래프 Fanout 분기 %q 실행 실패: %w", se.target, branchErr)
 				}
 				// 분기에서 parent 명령이 발생하면 즉시 전파
-				if branchResult.parentCmd != nil {
-					return branchResult, nil
+				if br.parentCmd != nil {
+					return br, nil
 				}
-				// 분기 결과를 공유 state에 병합한다(last-write-wins)
-				for k, v := range branchResult.state {
-					state[k] = v
+				// 분기 내 원본 업데이트를 순서대로 리듀서로 누적한다(ANALYSIS §2.2).
+				// raw 덮어쓰기 대신 applyReducers를 경유해 리듀서 등록 키가 모두 보존된다.
+				for _, u := range br.updates {
+					state = applyReducers(state, u, compiled.schema)
 				}
 			}
 			break
@@ -127,13 +132,19 @@ func invokeSubgraph(ctx context.Context, compiled *Compiled, input State, cfg co
 	return subgraphResult{state: state}, nil
 }
 
-// invokeSubgraphFromNode 는 서브그래프 Fanout 분기를 위한 내부 헬퍼다.
-// runFromNode의 서브그래프 버전으로 parent 명령을 감지해 반환한다.
-func invokeSubgraphFromNode(ctx context.Context, compiled *Compiled, startNode string, initState State, stepOffset int, cfg config.RunConfig) (subgraphResult, error) {
+// invokeSubgraphFromNodeCollect 는 서브그래프 Fanout 분기를 실행하되,
+// 분기 내 각 노드가 반환한 원본 업데이트 목록(updates)도 함께 반환한다.
+//
+// updates 를 외부 state 에 순서대로 applyReducers 로 적용하면
+// 이중 누적 없이 리듀서가 등록된 키를 올바르게 병합할 수 있다(ANALYSIS §2.2).
+// parent 명령이 발생하면 parentCmd를 채워 반환하고 병합은 호출자가 하지 않는다.
+func invokeSubgraphFromNodeCollect(ctx context.Context, compiled *Compiled, startNode string, initState State, stepOffset int, cfg config.RunConfig) (subgraphResult, error) {
 	state := make(State, len(initState))
 	for k, v := range initState {
 		state[k] = v
 	}
+
+	var updates []StateUpdate
 
 	current := startNode
 	for step := stepOffset; current != ""; step++ {
@@ -146,7 +157,7 @@ func invokeSubgraphFromNode(ctx context.Context, compiled *Compiled, startNode s
 			return subgraphResult{}, err
 		}
 
-		// ToParent/parent-Send 감지
+		// ToParent/parent-Send 감지: parent 명령 발생 시 즉시 전파
 		if res.Control != nil {
 			ctrl := res.Control
 			if ctrl.IsParent() && !ctrl.IsEnd() && len(ctrl.Sends) == 0 {
@@ -167,25 +178,32 @@ func invokeSubgraphFromNode(ctx context.Context, compiled *Compiled, startNode s
 			}
 		}
 
+		// 분기 내부 state를 갱신하고 원본 update를 목록에 추가한다.
 		state = applyReducers(state, res.Update, compiled.schema)
+		if res.Update != nil {
+			updates = append(updates, res.Update)
+		}
 
 		next, err := resolveNext(ctx, current, res, state, compiled.edges, compiled.condEdges, compiled.nodes)
 		if err != nil {
 			return subgraphResult{}, err
 		}
 
+		// 분기 내부 중첩 Fanout도 재귀 처리한다.
 		if len(next.sends) > 0 {
 			for _, se := range next.sends {
-				branchResult, branchErr := invokeSubgraphFromNode(ctx, compiled, se.target, se.state, step+1, cfg)
-				if branchErr != nil {
-					return subgraphResult{}, fmt.Errorf("graph: 중첩 서브그래프 Fanout 분기 %q 실행 실패: %w", se.target, branchErr)
+				inner, innerErr := invokeSubgraphFromNodeCollect(ctx, compiled, se.target, se.state, step+1, cfg)
+				if innerErr != nil {
+					return subgraphResult{}, fmt.Errorf("graph: 중첩 서브그래프 Fanout 분기 %q 실행 실패: %w", se.target, innerErr)
 				}
-				if branchResult.parentCmd != nil {
-					return branchResult, nil
+				if inner.parentCmd != nil {
+					return inner, nil
 				}
-				for k, v := range branchResult.state {
-					state[k] = v
+				// 내부 분기의 updates를 현재 분기 state에 반영하고 목록에 합산한다.
+				for _, u := range inner.updates {
+					state = applyReducers(state, u, compiled.schema)
 				}
+				updates = append(updates, inner.updates...)
 			}
 			break
 		}
@@ -193,7 +211,13 @@ func invokeSubgraphFromNode(ctx context.Context, compiled *Compiled, startNode s
 		current = next.target
 	}
 
-	return subgraphResult{state: state}, nil
+	return subgraphResult{state: state, updates: updates}, nil
+}
+
+// invokeSubgraphFromNode 는 invokeSubgraphFromNodeCollect 의 래퍼로,
+// 최종 state만 필요한 호출자를 위해 존재한다.
+func invokeSubgraphFromNode(ctx context.Context, compiled *Compiled, startNode string, initState State, stepOffset int, cfg config.RunConfig) (subgraphResult, error) {
+	return invokeSubgraphFromNodeCollect(ctx, compiled, startNode, initState, stepOffset, cfg)
 }
 
 // AsNode 는 이 Compiled 그래프를 부모 그래프의 NodeFunc 어댑터로 반환한다(ANALYSIS §2.5 D6).

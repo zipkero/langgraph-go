@@ -196,43 +196,63 @@ func coerceSendState(raw any, currentState State) (State, error) {
 	}
 }
 
-// runFromNode 는 지정된 startNode부터 실행 루프를 진행하는 내부 헬퍼다.
-// Fanout 분기가 Send.Target 노드부터 독립 실행될 때 호출한다.
-// stepOffset 은 현재 루프의 스텝 카운트를 이어받아 maxSteps 검사에 반영한다.
-func runFromNode(ctx context.Context, compiled *Compiled, startNode string, initState State, stepOffset int, cfg config.RunConfig) (State, error) {
+// branchResult 는 runFromNodeCollect 의 반환값이다.
+// finalState 는 분기 실행 후 최종 상태, updates 는 분기 내 각 노드가 반환한
+// 원본 업데이트 목록이다(ANALYSIS §2.2).
+// 외부에서 updates 를 순서대로 applyReducers 로 적용하면 이중 누적 없이 병합된다.
+type branchResult struct {
+	finalState State
+	updates    []StateUpdate
+}
+
+// runFromNodeCollect 는 runFromNode 와 동일하게 분기를 실행하되,
+// 분기 내 각 노드가 반환한 원본 업데이트 목록(updates)도 함께 반환한다.
+//
+// updates 목록을 외부 state 에 순서대로 applyReducers 로 적용하면
+// 분기가 공유 state 에 기여한 변경만 리듀서로 누적되므로 이중 누적이 없다(ANALYSIS §2.2).
+func runFromNodeCollect(ctx context.Context, compiled *Compiled, startNode string, initState State, stepOffset int, cfg config.RunConfig) (branchResult, error) {
 	state := make(State, len(initState))
 	for k, v := range initState {
 		state[k] = v
 	}
 
+	var updates []StateUpdate
+
 	current := startNode
 	for step := stepOffset; current != ""; step++ {
 		if err := checkMaxSteps(step, compiled.maxSteps); err != nil {
-			return nil, err
+			return branchResult{}, err
 		}
 
 		res, err := runNode(ctx, current, compiled.nodes, state)
 		if err != nil {
-			return nil, err
+			return branchResult{}, err
 		}
 
+		// 분기 내부 state를 갱신하고 원본 update를 목록에 추가한다.
 		state = applyReducers(state, res.Update, compiled.schema)
+		if res.Update != nil {
+			updates = append(updates, res.Update)
+		}
 
 		next, err := resolveNext(ctx, current, res, state, compiled.edges, compiled.condEdges, compiled.nodes)
 		if err != nil {
-			return nil, err
+			return branchResult{}, err
 		}
 
 		// 분기 내부에서 Fanout이 다시 발생하는 경우도 재귀 처리한다.
 		if len(next.sends) > 0 {
 			for _, se := range next.sends {
-				branchState, branchErr := runFromNode(ctx, compiled, se.target, se.state, step+1, cfg)
-				if branchErr != nil {
-					return nil, fmt.Errorf("graph: 중첩 Fanout 분기 %q 실행 실패: %w", se.target, branchErr)
+				inner, innerErr := runFromNodeCollect(ctx, compiled, se.target, se.state, step+1, cfg)
+				if innerErr != nil {
+					return branchResult{}, fmt.Errorf("graph: 중첩 Fanout 분기 %q 실행 실패: %w", se.target, innerErr)
 				}
-				for k, v := range branchState {
-					state[k] = v
+				// 내부 분기의 state 변경을 현재 분기 state에 반영하고
+				// 내부 분기 updates도 이 분기 updates 목록에 합산한다.
+				for _, u := range inner.updates {
+					state = applyReducers(state, u, compiled.schema)
 				}
+				updates = append(updates, inner.updates...)
 			}
 			break
 		}
@@ -240,7 +260,20 @@ func runFromNode(ctx context.Context, compiled *Compiled, startNode string, init
 		current = next.target
 	}
 
-	return state, nil
+	return branchResult{finalState: state, updates: updates}, nil
+}
+
+// runFromNode 는 지정된 startNode부터 실행 루프를 진행하는 내부 헬퍼다.
+// Fanout 분기가 Send.Target 노드부터 독립 실행될 때 호출한다.
+// stepOffset 은 현재 루프의 스텝 카운트를 이어받아 maxSteps 검사에 반영한다.
+//
+// 이 함수는 최종 state만 반환한다. 병합에는 runFromNodeCollect 를 사용한다.
+func runFromNode(ctx context.Context, compiled *Compiled, startNode string, initState State, stepOffset int, cfg config.RunConfig) (State, error) {
+	res, err := runFromNodeCollect(ctx, compiled, startNode, initState, stepOffset, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return res.finalState, nil
 }
 
 // checkMaxSteps 는 step이 maxSteps 이상이면 순환 무한 실행 차단 error를 반환한다(§5.10).
@@ -363,19 +396,21 @@ func invokeLoop(ctx context.Context, compiled *Compiled, input State, cfg config
 			return nil, err
 		}
 
-		// Fanout: 각 분기를 순차 실행하고 결과를 순서대로 병합한다(§2.3 D5).
-		// 각 분기는 Send.Target 노드부터 Send.State로 독립 실행되고,
-		// 결과 state가 공유 state에 last-write-wins로 덮어씌워진다.
+		// Fanout: 각 분기를 순차 실행하고 분기 내 원본 업데이트들을 리듀서로 누적한다
+		// (§2.3 D5, SPEC §5.1, §5.2, ANALYSIS §2.2).
+		// 각 분기는 Send.Target 노드부터 Send.State로 독립 실행된다.
+		// runFromNodeCollect 가 반환하는 updates 는 분기 내 노드들의 원본 업데이트 목록이므로,
+		// 순서대로 applyReducers 로 적용해도 base 키 이중 누적이 없다.
 		// task-009(서브그래프) 이전까지는 current-graph 분기만 지원한다.
 		if len(next.sends) > 0 {
 			for _, se := range next.sends {
-				branchState, branchErr := runFromNode(ctx, compiled, se.target, se.state, step+1, cfg)
+				br, branchErr := runFromNodeCollect(ctx, compiled, se.target, se.state, step+1, cfg)
 				if branchErr != nil {
 					return nil, fmt.Errorf("graph: Fanout 분기 %q 실행 실패: %w", se.target, branchErr)
 				}
-				// 분기 결과를 공유 state에 병합한다(last-write-wins).
-				for k, v := range branchState {
-					state[k] = v
+				// 분기 내 원본 업데이트를 순서대로 공유 state에 병합한다(ANALYSIS §2.2).
+				for _, u := range br.updates {
+					state = applyReducers(state, u, compiled.schema)
 				}
 			}
 			// Fanout 이후 루프 종료(분기가 내부 루프를 각자 완전 실행했으므로).

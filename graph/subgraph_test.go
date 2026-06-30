@@ -362,6 +362,143 @@ func TestSubgraph_독립상태_서브그래프내부_리듀서(t *testing.T) {
 	}
 }
 
+// TestSubgraph_Fanout_리듀서_분기누적 은 서브그래프 내부에서 Fanout이 발생했을 때
+// 같은 리듀서 키를 갱신하는 둘 이상의 분기 업데이트가 모두 보존됨을 검증한다.
+//
+// 구성:
+//   - 서브그래프 스키마: "messages" 키에 slice-append 리듀서 등록
+//   - fanout_node: Send("branch_a", nil), Send("branch_b", nil) 두 분기를 생성
+//   - branch_a: messages에 "msg_a" 추가
+//   - branch_b: messages에 "msg_b" 추가
+//
+// 검증:
+//   - Fanout 후 messages에 "msg_a"와 "msg_b"가 모두 보존된다(리듀서 병합).
+//   - 리듀서 미등록 키(last_branch)는 마지막 분기 값이 남는다(종전 동작 유지).
+//   - base 키(initial)는 이중 누적 없이 한 번만 존재한다.
+func TestSubgraph_Fanout_리듀서_분기누적(t *testing.T) {
+	sliceAppend := func(cur, upd any) any {
+		var base []any
+		if cur != nil {
+			if s, ok := cur.([]any); ok {
+				base = s
+			}
+		}
+		if upd == nil {
+			return base
+		}
+		return append(base, upd)
+	}
+
+	subSchema := graph.StateSchema{
+		Reducers: map[string]graph.ReducerFunc{
+			"messages": sliceAppend,
+		},
+	}
+
+	sb := graph.NewStateGraph(subSchema)
+
+	// fanout_node: 두 분기 Send
+	fanoutNode := func(ctx context.Context, st graph.State) (any, error) {
+		return command.Fanout([]command.Send{
+			command.NewSend("branch_a", nil),
+			command.NewSend("branch_b", nil),
+		}), nil
+	}
+	// branch_a: messages에 "msg_a" 추가
+	branchA := func(ctx context.Context, st graph.State) (any, error) {
+		return graph.StateUpdate{
+			"messages":    "msg_a",
+			"last_branch": "a",
+		}, nil
+	}
+	// branch_b: messages에 "msg_b" 추가
+	branchB := func(ctx context.Context, st graph.State) (any, error) {
+		return graph.StateUpdate{
+			"messages":    "msg_b",
+			"last_branch": "b",
+		}, nil
+	}
+
+	if err := sb.AddNode("fanout_node", fanoutNode); err != nil {
+		t.Fatalf("AddNode fanout_node 실패: %v", err)
+	}
+	if err := sb.AddNode("branch_a", branchA); err != nil {
+		t.Fatalf("AddNode branch_a 실패: %v", err)
+	}
+	if err := sb.AddNode("branch_b", branchB); err != nil {
+		t.Fatalf("AddNode branch_b 실패: %v", err)
+	}
+	if err := sb.SetEntryPoint("fanout_node"); err != nil {
+		t.Fatalf("SetEntryPoint 실패: %v", err)
+	}
+	// 도달성: fanout_node에서 branch_a, branch_b로 정적 엣지 추가(BFS용)
+	if err := sb.AddEdge("fanout_node", "branch_a"); err != nil {
+		t.Fatalf("AddEdge fanout_node→branch_a 실패: %v", err)
+	}
+	if err := sb.AddEdge("fanout_node", "branch_b"); err != nil {
+		t.Fatalf("AddEdge fanout_node→branch_b 실패: %v", err)
+	}
+
+	sub, err := sb.Compile()
+	if err != nil {
+		t.Fatalf("서브그래프 Compile 실패: %v", err)
+	}
+
+	// 부모 그래프에 서브그래프 노드로 등록
+	pb := graph.NewStateGraph(graph.StateSchema{})
+	if err := pb.AddNode("subgraph_node", sub.AsNode()); err != nil {
+		t.Fatalf("부모 AddNode 실패: %v", err)
+	}
+	if err := pb.SetEntryPoint("subgraph_node"); err != nil {
+		t.Fatalf("부모 SetEntryPoint 실패: %v", err)
+	}
+	parentCompiled, err := pb.Compile()
+	if err != nil {
+		t.Fatalf("부모 Compile 실패: %v", err)
+	}
+
+	initial := graph.State{"initial": "base"}
+	result, err := parentCompiled.Invoke(context.Background(), initial, config.RunConfig{})
+	if err != nil {
+		t.Fatalf("부모 Invoke 실패: %v", err)
+	}
+
+	// messages에 두 분기 업데이트가 모두 보존됐는지 확인(리듀서 병합)
+	msgs, ok := result["messages"]
+	if !ok {
+		t.Fatal("result에 messages 키가 없습니다")
+	}
+	msgsSlice, ok := msgs.([]any)
+	if !ok {
+		t.Fatalf("messages 타입 오류: got %T, want []any", msgs)
+	}
+	if len(msgsSlice) != 2 {
+		t.Fatalf("messages 길이 오류: want 2, got %d (%v)", len(msgsSlice), msgsSlice)
+	}
+	hasA, hasB := false, false
+	for _, m := range msgsSlice {
+		if m == "msg_a" {
+			hasA = true
+		}
+		if m == "msg_b" {
+			hasB = true
+		}
+	}
+	if !hasA || !hasB {
+		t.Fatalf("두 분기 메시지가 모두 보존되지 않았습니다: got %v", msgsSlice)
+	}
+
+	// 리듀서 미등록 키(last_branch)는 마지막 분기 값이 남는다(종전 동작 유지)
+	if _, ok := result["last_branch"]; !ok {
+		t.Fatal("result에 last_branch 키가 없습니다")
+	}
+
+	// base 키(initial)는 이중 누적 없이 보존된다
+	if result["initial"] != "base" {
+		t.Fatalf("initial 값 오류: want base, got %v", result["initial"])
+	}
+}
+
 // TestSubgraph_공유상태_다중노드 는 공유 상태 모드에서 서브그래프의 여러 노드가
 // 순차 실행되며 모든 변경이 부모로 반영됨을 검증한다.
 func TestSubgraph_공유상태_다중노드(t *testing.T) {

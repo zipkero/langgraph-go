@@ -15,6 +15,7 @@ import (
 	"github.com/zipkero/langgraph-go/config"
 	"github.com/zipkero/langgraph-go/core"
 	"github.com/zipkero/langgraph-go/graph"
+	"github.com/zipkero/langgraph-go/graph/command"
 )
 
 // collectEvents 는 채널에서 모든 GraphEvent를 수집해 슬라이스로 반환하는 헬퍼다.
@@ -588,5 +589,319 @@ func TestStream_ModeMessages_StreamTokens없는노드_이벤트없음(t *testing
 		if evt.Mode == core.ModeMessages && evt.Token != "" {
 			t.Fatalf("예상치 않은 토큰 이벤트: %v", evt)
 		}
+	}
+}
+
+// addMessagesReducer 는 stream 테스트에서 공유하는 slice-append 리듀서 헬퍼다.
+func addMessagesReducer(cur, upd any) any {
+	var base []any
+	if cur != nil {
+		if s, ok := cur.([]any); ok {
+			base = append(base, s...)
+		}
+	}
+	if upd == nil {
+		return base
+	}
+	switch v := upd.(type) {
+	case []any:
+		return append(base, v...)
+	default:
+		return append(base, v)
+	}
+}
+
+// TestStream_Fanout_리듀서키_양쪽분기_모두보존 은 Stream 실행에서 두 Send 분기가 같은
+// 리듀서 등록 키를 갱신할 때 양쪽 업데이트가 모두 보존됨을 검증한다(task-003 회귀 테스트).
+//
+// 그래프 구성:
+//
+//	dispatcher → [Fanout([Send("branchA", nil), Send("branchB", nil)])]
+//	  - "messages" 키에 addMessages(slice-append) 리듀서 등록
+//	  - branchA: messages에 "msg-A" 추가, label = "from-A"
+//	  - branchB: messages에 "msg-B" 추가, label = "from-B"
+//
+// 검증 포인트:
+//   - messages에 msg-base(초기), msg-A, msg-B 세 값이 모두 보존됨(리듀서 병합)
+//   - label은 마지막 분기(branchB) 값(last-write-wins)
+//   - base_val은 이중 누적 없이 초기값 유지
+//   - ModeValues 이벤트가 정상 방출됨(토큰·이벤트 방출 순서 유지 확인)
+func TestStream_Fanout_리듀서키_양쪽분기_모두보존(t *testing.T) {
+	schema := graph.StateSchema{
+		Reducers: map[string]graph.ReducerFunc{
+			"messages": addMessagesReducer,
+		},
+	}
+	b := graph.NewStateGraph(schema)
+
+	// dispatcher 노드: 두 분기로 Fanout
+	dispatcherNode := func(ctx context.Context, st graph.State) (any, error) {
+		return command.Fanout([]command.Send{
+			command.NewSend("branchA", nil),
+			command.NewSend("branchB", nil),
+		}), nil
+	}
+
+	// branchA: messages에 "msg-A" 추가
+	branchANode := func(ctx context.Context, st graph.State) (any, error) {
+		return graph.StateUpdate{"messages": "msg-A", "label": "from-A"}, nil
+	}
+
+	// branchB: messages에 "msg-B" 추가
+	branchBNode := func(ctx context.Context, st graph.State) (any, error) {
+		return graph.StateUpdate{"messages": "msg-B", "label": "from-B"}, nil
+	}
+
+	if err := b.AddNode("dispatcher", dispatcherNode); err != nil {
+		t.Fatalf("AddNode dispatcher 실패: %v", err)
+	}
+	if err := b.AddNode("branchA", branchANode); err != nil {
+		t.Fatalf("AddNode branchA 실패: %v", err)
+	}
+	if err := b.AddNode("branchB", branchBNode); err != nil {
+		t.Fatalf("AddNode branchB 실패: %v", err)
+	}
+	// Compile 도달 가능성을 위해 조건 엣지 추가
+	router := func(ctx context.Context, st graph.State) string { return "a" }
+	if err := b.AddConditionalEdges("dispatcher", router, map[string]string{
+		"a": "branchA",
+		"b": "branchB",
+	}); err != nil {
+		t.Fatalf("AddConditionalEdges 실패: %v", err)
+	}
+	if err := b.SetEntryPoint("dispatcher"); err != nil {
+		t.Fatalf("SetEntryPoint 실패: %v", err)
+	}
+
+	compiled, err := b.Compile()
+	if err != nil {
+		t.Fatalf("Compile 실패: %v", err)
+	}
+
+	initial := graph.State{
+		"base_val": "initial",
+		"messages": []any{"msg-base"},
+	}
+
+	ch, err := compiled.Stream(context.Background(), initial, config.RunConfig{}, core.ModeValues)
+	if err != nil {
+		t.Fatalf("Stream 시작 실패: %v", err)
+	}
+
+	var lastValueEvent *graph.GraphEvent
+	for evt := range ch {
+		if evt.Mode == core.ModeValues {
+			e := evt
+			lastValueEvent = &e
+		}
+	}
+
+	if lastValueEvent == nil {
+		t.Fatal("ModeValues 이벤트가 방출되지 않았습니다")
+	}
+	finalState := lastValueEvent.Value
+
+	// messages: base("msg-base") + branchA("msg-A") + branchB("msg-B") = 3개
+	msgs, ok := finalState["messages"]
+	if !ok {
+		t.Fatal("finalState에 messages 키가 없습니다")
+	}
+	msgsSlice, ok := msgs.([]any)
+	if !ok {
+		t.Fatalf("messages 타입 오류: got %T", msgs)
+	}
+	if len(msgsSlice) != 3 {
+		t.Fatalf("messages 길이 오류: want 3 (base+A+B), got %d (%v)", len(msgsSlice), msgsSlice)
+	}
+	if msgsSlice[0] != "msg-base" {
+		t.Fatalf("messages[0] 오류: want msg-base, got %v", msgsSlice[0])
+	}
+	if msgsSlice[1] != "msg-A" {
+		t.Fatalf("messages[1] 오류: want msg-A, got %v", msgsSlice[1])
+	}
+	if msgsSlice[2] != "msg-B" {
+		t.Fatalf("messages[2] 오류: want msg-B, got %v", msgsSlice[2])
+	}
+
+	// label: last-write-wins(branchB)
+	if finalState["label"] != "from-B" {
+		t.Fatalf("label 오류: want from-B, got %v", finalState["label"])
+	}
+
+	// base_val: 분기가 갱신하지 않았으므로 이중 누적 없이 원래 값 유지
+	if finalState["base_val"] != "initial" {
+		t.Fatalf("base_val 오류: want initial, got %v (이중 누적 의심)", finalState["base_val"])
+	}
+}
+
+// TestStream_Fanout_리듀서키_ModeUpdates_이벤트순서 는 ModeUpdates 모드에서 Fanout 분기의
+// 각 노드 업데이트 이벤트가 방출되고 최종 상태에 리듀서 병합이 적용됨을 검증한다.
+//
+// 그래프 구성: dispatcher → [branchA, branchB](Fanout)
+// 검증 포인트:
+//   - 각 분기 노드의 ModeUpdates 이벤트가 방출됨
+//   - 최종 상태에서 messages 리듀서 키에 양쪽 값이 모두 보존됨
+func TestStream_Fanout_리듀서키_ModeUpdates_이벤트순서(t *testing.T) {
+	schema := graph.StateSchema{
+		Reducers: map[string]graph.ReducerFunc{
+			"messages": addMessagesReducer,
+		},
+	}
+	b := graph.NewStateGraph(schema)
+
+	dispatcherNode := func(ctx context.Context, st graph.State) (any, error) {
+		return command.Fanout([]command.Send{
+			command.NewSend("branchA", nil),
+			command.NewSend("branchB", nil),
+		}), nil
+	}
+	branchANode := func(ctx context.Context, st graph.State) (any, error) {
+		return graph.StateUpdate{"messages": "msg-A"}, nil
+	}
+	branchBNode := func(ctx context.Context, st graph.State) (any, error) {
+		return graph.StateUpdate{"messages": "msg-B"}, nil
+	}
+
+	if err := b.AddNode("dispatcher", dispatcherNode); err != nil {
+		t.Fatalf("AddNode dispatcher 실패: %v", err)
+	}
+	if err := b.AddNode("branchA", branchANode); err != nil {
+		t.Fatalf("AddNode branchA 실패: %v", err)
+	}
+	if err := b.AddNode("branchB", branchBNode); err != nil {
+		t.Fatalf("AddNode branchB 실패: %v", err)
+	}
+	router := func(ctx context.Context, st graph.State) string { return "a" }
+	if err := b.AddConditionalEdges("dispatcher", router, map[string]string{
+		"a": "branchA",
+		"b": "branchB",
+	}); err != nil {
+		t.Fatalf("AddConditionalEdges 실패: %v", err)
+	}
+	if err := b.SetEntryPoint("dispatcher"); err != nil {
+		t.Fatalf("SetEntryPoint 실패: %v", err)
+	}
+
+	compiled, err := b.Compile()
+	if err != nil {
+		t.Fatalf("Compile 실패: %v", err)
+	}
+
+	ch, err := compiled.Stream(context.Background(), graph.State{}, config.RunConfig{}, core.ModeUpdates)
+	if err != nil {
+		t.Fatalf("Stream 시작 실패: %v", err)
+	}
+
+	var updateEvents []graph.GraphEvent
+	for evt := range ch {
+		if evt.Mode == core.ModeUpdates {
+			updateEvents = append(updateEvents, evt)
+		}
+	}
+
+	// branchA, branchB 각각의 업데이트 이벤트가 방출돼야 한다
+	branchNodes := map[string]bool{}
+	for _, evt := range updateEvents {
+		branchNodes[evt.Node] = true
+	}
+	if !branchNodes["branchA"] {
+		t.Fatalf("branchA 노드의 ModeUpdates 이벤트가 없습니다. 방출된 노드: %v", branchNodes)
+	}
+	if !branchNodes["branchB"] {
+		t.Fatalf("branchB 노드의 ModeUpdates 이벤트가 없습니다. 방출된 노드: %v", branchNodes)
+	}
+}
+
+// TestStream_Fanout_Invoke와_동일한_최종상태 는 같은 fanout 그래프를 Stream과 Invoke로
+// 각각 실행했을 때 최종 상태가 동일함을 검증한다(SPEC §5.3, task-003 검증 조건).
+//
+// 이 테스트는 Stream·Invoke 경로의 병합 의미 일관성을 교차 검증한다.
+func TestStream_Fanout_Invoke와_동일한_최종상태(t *testing.T) {
+	schema := graph.StateSchema{
+		Reducers: map[string]graph.ReducerFunc{
+			"messages": addMessagesReducer,
+		},
+	}
+
+	buildGraph := func(t *testing.T) *graph.Compiled {
+		t.Helper()
+		b := graph.NewStateGraph(schema)
+		dispatcherNode := func(ctx context.Context, st graph.State) (any, error) {
+			return command.Fanout([]command.Send{
+				command.NewSend("branchA", nil),
+				command.NewSend("branchB", nil),
+			}), nil
+		}
+		branchANode := func(ctx context.Context, st graph.State) (any, error) {
+			return graph.StateUpdate{"messages": "msg-A", "tag": "A"}, nil
+		}
+		branchBNode := func(ctx context.Context, st graph.State) (any, error) {
+			return graph.StateUpdate{"messages": "msg-B", "tag": "B"}, nil
+		}
+		if err := b.AddNode("dispatcher", dispatcherNode); err != nil {
+			t.Fatalf("AddNode dispatcher 실패: %v", err)
+		}
+		if err := b.AddNode("branchA", branchANode); err != nil {
+			t.Fatalf("AddNode branchA 실패: %v", err)
+		}
+		if err := b.AddNode("branchB", branchBNode); err != nil {
+			t.Fatalf("AddNode branchB 실패: %v", err)
+		}
+		router := func(ctx context.Context, st graph.State) string { return "a" }
+		if err := b.AddConditionalEdges("dispatcher", router, map[string]string{
+			"a": "branchA",
+			"b": "branchB",
+		}); err != nil {
+			t.Fatalf("AddConditionalEdges 실패: %v", err)
+		}
+		if err := b.SetEntryPoint("dispatcher"); err != nil {
+			t.Fatalf("SetEntryPoint 실패: %v", err)
+		}
+		compiled, err := b.Compile()
+		if err != nil {
+			t.Fatalf("Compile 실패: %v", err)
+		}
+		return compiled
+	}
+
+	initial := graph.State{"messages": []any{"msg-init"}}
+
+	// Invoke 경로로 실행
+	invokeResult, err := buildGraph(t).Invoke(context.Background(), initial, config.RunConfig{})
+	if err != nil {
+		t.Fatalf("Invoke 실패: %v", err)
+	}
+
+	// Stream 경로로 실행 후 마지막 ModeValues 이벤트에서 최종 상태 추출
+	ch, err := buildGraph(t).Stream(context.Background(), initial, config.RunConfig{}, core.ModeValues)
+	if err != nil {
+		t.Fatalf("Stream 시작 실패: %v", err)
+	}
+	var streamFinalState graph.State
+	for evt := range ch {
+		if evt.Mode == core.ModeValues {
+			streamFinalState = evt.Value
+		}
+	}
+	if streamFinalState == nil {
+		t.Fatal("Stream ModeValues 이벤트가 방출되지 않았습니다")
+	}
+
+	// messages 비교: Invoke와 Stream 최종 상태가 동일해야 한다
+	invokeMsgs, _ := invokeResult["messages"].([]any)
+	streamMsgs, _ := streamFinalState["messages"].([]any)
+	if len(invokeMsgs) != len(streamMsgs) {
+		t.Fatalf("messages 길이 불일치: Invoke=%d(%v), Stream=%d(%v)",
+			len(invokeMsgs), invokeMsgs, len(streamMsgs), streamMsgs)
+	}
+	for i := range invokeMsgs {
+		if invokeMsgs[i] != streamMsgs[i] {
+			t.Fatalf("messages[%d] 불일치: Invoke=%v, Stream=%v", i, invokeMsgs[i], streamMsgs[i])
+		}
+	}
+
+	// tag(last-write-wins): 두 경로 동일
+	if invokeResult["tag"] != streamFinalState["tag"] {
+		t.Fatalf("tag 불일치: Invoke=%v, Stream=%v", invokeResult["tag"], streamFinalState["tag"])
 	}
 }

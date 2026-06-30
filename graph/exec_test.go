@@ -10,6 +10,7 @@ import (
 
 	"github.com/zipkero/langgraph-go/config"
 	"github.com/zipkero/langgraph-go/graph"
+	"github.com/zipkero/langgraph-go/graph/command"
 )
 
 // TestInvoke_리듀서필드누적_덮어쓰기 는 등록된 리듀서 필드가 누적 병합되고,
@@ -311,5 +312,263 @@ func TestInvoke_초기상태병합(t *testing.T) {
 	}
 	if result["y"] != "preserved" {
 		t.Fatalf("y 값 오류: want preserved, got %v", result["y"])
+	}
+}
+
+// TestInvoke_Fanout_리듀서키_양쪽분기_모두보존 은 두 Send 분기가 같은 리듀서 등록 키를
+// 갱신할 때 양쪽 분기의 업데이트가 모두 보존됨을 검증한다(task-001 회귀 테스트).
+//
+// 그래프 구성:
+//
+//	dispatcher → [Fanout([Send("branchA", nil), Send("branchB", nil)])]
+//	  - "messages" 키에 AddMessages(slice-append) 리듀서 등록
+//	  - branchA: messages에 "msg-A" 추가
+//	  - branchB: messages에 "msg-B" 추가
+//	  - "label"  키: 리듀서 미등록(last-write-wins)
+//	  - branchA: label = "from-A"
+//	  - branchB: label = "from-B"
+//
+// 검증 포인트:
+//   - messages에 msg-A, msg-B 둘 다 보존됨(리듀서 병합)
+//   - label에는 마지막 분기(branchB) 값만 남음(last-write-wins)
+//   - base 키("base_val")가 이중 누적되지 않음(delta 기준 병합)
+func TestInvoke_Fanout_리듀서키_양쪽분기_모두보존(t *testing.T) {
+	// messages 필드에 등록할 slice-append 리듀서(AddMessages 역할)
+	addMessages := func(cur, upd any) any {
+		var base []any
+		if cur != nil {
+			if s, ok := cur.([]any); ok {
+				base = append(base, s...)
+			}
+		}
+		if upd == nil {
+			return base
+		}
+		// 단일 값이면 그대로 추가, 슬라이스이면 펼쳐서 추가
+		switch v := upd.(type) {
+		case []any:
+			return append(base, v...)
+		default:
+			return append(base, v)
+		}
+	}
+
+	schema := graph.StateSchema{
+		Reducers: map[string]graph.ReducerFunc{
+			"messages": addMessages,
+		},
+	}
+	b := graph.NewStateGraph(schema)
+
+	// dispatcher 노드: 두 분기로 Fanout(Send.State=nil → 현재 상태 전달)
+	dispatcherNode := func(ctx context.Context, st graph.State) (any, error) {
+		return command.Fanout([]command.Send{
+			command.NewSend("branchA", nil),
+			command.NewSend("branchB", nil),
+		}), nil
+	}
+
+	// branchA: messages에 "msg-A" 추가, label = "from-A"
+	branchANode := func(ctx context.Context, st graph.State) (any, error) {
+		return graph.StateUpdate{"messages": "msg-A", "label": "from-A"}, nil
+	}
+
+	// branchB: messages에 "msg-B" 추가, label = "from-B"
+	branchBNode := func(ctx context.Context, st graph.State) (any, error) {
+		return graph.StateUpdate{"messages": "msg-B", "label": "from-B"}, nil
+	}
+
+	if err := b.AddNode("dispatcher", dispatcherNode); err != nil {
+		t.Fatalf("AddNode dispatcher 실패: %v", err)
+	}
+	if err := b.AddNode("branchA", branchANode); err != nil {
+		t.Fatalf("AddNode branchA 실패: %v", err)
+	}
+	if err := b.AddNode("branchB", branchBNode); err != nil {
+		t.Fatalf("AddNode branchB 실패: %v", err)
+	}
+	// Compile 도달 가능성을 위해 조건 엣지 추가
+	router := func(ctx context.Context, st graph.State) string { return "a" }
+	if err := b.AddConditionalEdges("dispatcher", router, map[string]string{
+		"a": "branchA",
+		"b": "branchB",
+	}); err != nil {
+		t.Fatalf("AddConditionalEdges 실패: %v", err)
+	}
+	if err := b.SetEntryPoint("dispatcher"); err != nil {
+		t.Fatalf("SetEntryPoint 실패: %v", err)
+	}
+
+	compiled, err := b.Compile()
+	if err != nil {
+		t.Fatalf("Compile 실패: %v", err)
+	}
+
+	// 초기 상태에 base_val을 두어 이중 누적 여부를 검증한다.
+	initial := graph.State{
+		"base_val": "initial",
+		"messages": []any{"msg-base"},
+	}
+	result, err := compiled.Invoke(context.Background(), initial, config.RunConfig{})
+	if err != nil {
+		t.Fatalf("Invoke 실패: %v", err)
+	}
+
+	// messages: base("msg-base") + branchA("msg-A") + branchB("msg-B") = 3개
+	msgs, ok := result["messages"]
+	if !ok {
+		t.Fatal("result에 messages 키가 없습니다")
+	}
+	msgsSlice, ok := msgs.([]any)
+	if !ok {
+		t.Fatalf("messages 타입 오류: got %T", msgs)
+	}
+	if len(msgsSlice) != 3 {
+		t.Fatalf("messages 길이 오류: want 3 (base+A+B), got %d (%v)", len(msgsSlice), msgsSlice)
+	}
+	// 순서: base → A → B (순차 실행)
+	if msgsSlice[0] != "msg-base" {
+		t.Fatalf("messages[0] 오류: want msg-base, got %v", msgsSlice[0])
+	}
+	if msgsSlice[1] != "msg-A" {
+		t.Fatalf("messages[1] 오류: want msg-A, got %v", msgsSlice[1])
+	}
+	if msgsSlice[2] != "msg-B" {
+		t.Fatalf("messages[2] 오류: want msg-B, got %v", msgsSlice[2])
+	}
+
+	// label: 리듀서 미등록 → last-write-wins(branchB가 마지막)
+	label, ok := result["label"]
+	if !ok {
+		t.Fatal("result에 label 키가 없습니다")
+	}
+	if label != "from-B" {
+		t.Fatalf("label 값 오류: want from-B, got %v", label)
+	}
+
+	// base_val: 분기가 갱신하지 않았으므로 delta에 포함 안 됨 → 원래 값 유지
+	baseVal, ok := result["base_val"]
+	if !ok {
+		t.Fatal("result에 base_val 키가 없습니다")
+	}
+	if baseVal != "initial" {
+		t.Fatalf("base_val 오류: want initial, got %v (이중 누적 의심)", baseVal)
+	}
+}
+
+// TestInvoke_Fanout_리듀서키_중첩분기_모두보존 은 runFromNode 내부의 중첩 Fanout에서도
+// 리듀서 병합이 적용됨을 검증한다(task-001 회귀 테스트).
+//
+// 그래프 구성:
+//
+//	start → dispatch(Fanout) → [inner(중첩 Fanout)] → [leafA, leafB]
+//	  - "items" 키에 slice-append 리듀서 등록
+//	  - leafA: items에 "leaf-A" 추가
+//	  - leafB: items에 "leaf-B" 추가
+//
+// 검증 포인트:
+//   - items에 leaf-A, leaf-B 둘 다 보존됨(중첩 분기 리듀서 병합)
+func TestInvoke_Fanout_리듀서키_중첩분기_모두보존(t *testing.T) {
+	sliceAppend := func(cur, upd any) any {
+		var base []any
+		if cur != nil {
+			if s, ok := cur.([]any); ok {
+				base = append(base, s...)
+			}
+		}
+		if upd == nil {
+			return base
+		}
+		return append(base, upd)
+	}
+
+	schema := graph.StateSchema{
+		Reducers: map[string]graph.ReducerFunc{
+			"items": sliceAppend,
+		},
+	}
+	b := graph.NewStateGraph(schema)
+
+	// dispatch 노드: inner 노드 하나로 Fanout
+	dispatchNode := func(ctx context.Context, st graph.State) (any, error) {
+		return command.Fanout([]command.Send{
+			command.NewSend("inner", nil),
+		}), nil
+	}
+
+	// inner 노드: leafA, leafB로 중첩 Fanout
+	innerNode := func(ctx context.Context, st graph.State) (any, error) {
+		return command.Fanout([]command.Send{
+			command.NewSend("leafA", nil),
+			command.NewSend("leafB", nil),
+		}), nil
+	}
+
+	leafANode := func(ctx context.Context, st graph.State) (any, error) {
+		return graph.StateUpdate{"items": "leaf-A"}, nil
+	}
+	leafBNode := func(ctx context.Context, st graph.State) (any, error) {
+		return graph.StateUpdate{"items": "leaf-B"}, nil
+	}
+
+	for _, n := range []struct {
+		name string
+		fn   func(context.Context, graph.State) (any, error)
+	}{
+		{"dispatch", dispatchNode},
+		{"inner", innerNode},
+		{"leafA", leafANode},
+		{"leafB", leafBNode},
+	} {
+		if err := b.AddNode(n.name, n.fn); err != nil {
+			t.Fatalf("AddNode %s 실패: %v", n.name, err)
+		}
+	}
+	// Compile 도달 가능성을 위해 조건 엣지 추가
+	router := func(ctx context.Context, st graph.State) string { return "inner" }
+	if err := b.AddConditionalEdges("dispatch", router, map[string]string{"inner": "inner"}); err != nil {
+		t.Fatalf("AddConditionalEdges dispatch 실패: %v", err)
+	}
+	router2 := func(ctx context.Context, st graph.State) string { return "a" }
+	if err := b.AddConditionalEdges("inner", router2, map[string]string{
+		"a": "leafA",
+		"b": "leafB",
+	}); err != nil {
+		t.Fatalf("AddConditionalEdges inner 실패: %v", err)
+	}
+	if err := b.SetEntryPoint("dispatch"); err != nil {
+		t.Fatalf("SetEntryPoint 실패: %v", err)
+	}
+
+	compiled, err := b.Compile()
+	if err != nil {
+		t.Fatalf("Compile 실패: %v", err)
+	}
+
+	result, err := compiled.Invoke(context.Background(), graph.State{}, config.RunConfig{})
+	if err != nil {
+		t.Fatalf("Invoke 실패: %v", err)
+	}
+
+	items, ok := result["items"]
+	if !ok {
+		t.Fatal("result에 items 키가 없습니다")
+	}
+	itemsSlice, ok := items.([]any)
+	if !ok {
+		t.Fatalf("items 타입 오류: got %T", items)
+	}
+	if len(itemsSlice) != 2 {
+		t.Fatalf("items 길이 오류: want 2 (leaf-A+leaf-B), got %d (%v)", len(itemsSlice), itemsSlice)
+	}
+	found := map[any]bool{}
+	for _, v := range itemsSlice {
+		found[v] = true
+	}
+	if !found["leaf-A"] {
+		t.Fatalf("items에 leaf-A가 없습니다: %v", itemsSlice)
+	}
+	if !found["leaf-B"] {
+		t.Fatalf("items에 leaf-B가 없습니다: %v", itemsSlice)
 	}
 }

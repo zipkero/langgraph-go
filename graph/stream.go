@@ -249,16 +249,37 @@ func streamLoop(ctx context.Context, compiled *Compiled, input State, cfg config
 			return nil, err
 		}
 
-		// Fanout 처리
+		// Fanout 처리: 각 분기를 순차 실행하고 분기 내 원본 업데이트들을 리듀서로 누적한다
+		// (SPEC §5.3, ANALYSIS §2.1, §2.2). raw 덮어쓰기 대신 updates를 applyReducers로 누적해
+		// 리듀서 등록 키가 여러 분기에서 업데이트되어도 모두 보존된다.
 		if len(next.sends) > 0 {
 			for _, se := range next.sends {
-				branchState, branchErr := streamFromNode(ctx, compiled, se.target, se.state, step+1, cfg, opts)
+				br, branchErr := streamFromNodeCollect(ctx, compiled, se.target, se.state, step+1, cfg, opts)
 				if branchErr != nil {
 					return nil, fmt.Errorf("graph: Stream Fanout 분기 %q 실행 실패: %w", se.target, branchErr)
 				}
-				for k, v := range branchState {
-					state[k] = v
+				// 분기 내 원본 업데이트를 순서대로 공유 state에 병합한다(ANALYSIS §2.2).
+				for _, u := range br.updates {
+					state = applyReducers(state, u, compiled.schema)
 				}
+			}
+			// 모든 분기 업데이트가 누적된 최종 state를 방출한다.
+			// 각 분기는 독립적인 내부 state 기준으로 이벤트를 방출하므로,
+			// 병합된 최종 state를 별도로 방출해야 관찰자가 올바른 최종 상태를 볼 수 있다.
+			if opts.mode == core.ModeValues {
+				valueCopy := make(State, len(state))
+				for k, v := range state {
+					valueCopy[k] = v
+				}
+				evt := GraphEvent{
+					Node:  current,
+					Mode:  core.ModeValues,
+					Value: valueCopy,
+				}
+				if len(opts.pathPrefix) > 0 {
+					evt.Path = opts.pathPrefix
+				}
+				emitEvent(ctx, opts.out, evt)
 			}
 			break
 		}
@@ -269,24 +290,30 @@ func streamLoop(ctx context.Context, compiled *Compiled, input State, cfg config
 	return filterBySchema(state, compiled.schemaOpts.outputSchema), nil
 }
 
-// streamFromNode 는 스트리밍 모드의 Fanout 분기 실행 헬퍼다.
-// invokeLoop의 runFromNode에 대응하며 GraphEvent 방출을 포함한다.
-func streamFromNode(ctx context.Context, compiled *Compiled, startNode string, initState State, stepOffset int, cfg config.RunConfig, opts streamLoopOpts) (State, error) {
+// streamFromNodeCollect 는 스트리밍 모드의 Fanout 분기 실행 헬퍼다.
+// streamFromNode와 동일하게 분기를 실행하고 GraphEvent를 방출하되,
+// 분기 내 각 노드가 반환한 원본 업데이트 목록(updates)도 함께 반환한다(ANALYSIS §2.2).
+//
+// updates 목록을 외부 state에 순서대로 applyReducers로 적용하면
+// 분기가 공유 state에 기여한 변경만 리듀서로 누적되므로 이중 누적이 없다(ANALYSIS §2.2).
+func streamFromNodeCollect(ctx context.Context, compiled *Compiled, startNode string, initState State, stepOffset int, cfg config.RunConfig, opts streamLoopOpts) (branchResult, error) {
 	state := make(State, len(initState))
 	for k, v := range initState {
 		state[k] = v
 	}
 
+	var updates []StateUpdate
+
 	current := startNode
 	for step := stepOffset; current != ""; step++ {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return branchResult{}, ctx.Err()
 		default:
 		}
 
 		if err := checkMaxSteps(step, compiled.maxSteps); err != nil {
-			return nil, err
+			return branchResult{}, err
 		}
 
 		if opts.mode == core.ModeDebug {
@@ -334,7 +361,7 @@ func streamFromNode(ctx context.Context, compiled *Compiled, startNode string, i
 		}
 
 		if err != nil {
-			return nil, err
+			return branchResult{}, err
 		}
 
 		if opts.mode == core.ModeUpdates && res.Update != nil {
@@ -353,7 +380,11 @@ func streamFromNode(ctx context.Context, compiled *Compiled, startNode string, i
 			emitEvent(ctx, opts.out, evt)
 		}
 
+		// 분기 내부 state를 갱신하고 원본 update를 목록에 추가한다.
 		state = applyReducers(state, res.Update, compiled.schema)
+		if res.Update != nil {
+			updates = append(updates, res.Update)
+		}
 
 		if opts.mode == core.ModeValues {
 			valueCopy := make(State, len(state))
@@ -385,18 +416,22 @@ func streamFromNode(ctx context.Context, compiled *Compiled, startNode string, i
 
 		next, err := resolveNext(ctx, current, res, state, compiled.edges, compiled.condEdges, compiled.nodes)
 		if err != nil {
-			return nil, err
+			return branchResult{}, err
 		}
 
+		// 분기 내부에서 Fanout이 다시 발생하는 경우도 재귀 처리한다.
 		if len(next.sends) > 0 {
 			for _, se := range next.sends {
-				branchState, branchErr := streamFromNode(ctx, compiled, se.target, se.state, step+1, cfg, opts)
-				if branchErr != nil {
-					return nil, fmt.Errorf("graph: 중첩 Stream Fanout 분기 %q 실행 실패: %w", se.target, branchErr)
+				inner, innerErr := streamFromNodeCollect(ctx, compiled, se.target, se.state, step+1, cfg, opts)
+				if innerErr != nil {
+					return branchResult{}, fmt.Errorf("graph: 중첩 Stream Fanout 분기 %q 실행 실패: %w", se.target, innerErr)
 				}
-				for k, v := range branchState {
-					state[k] = v
+				// 내부 분기의 state 변경을 현재 분기 state에 반영하고
+				// 내부 분기 updates도 이 분기 updates 목록에 합산한다.
+				for _, u := range inner.updates {
+					state = applyReducers(state, u, compiled.schema)
 				}
+				updates = append(updates, inner.updates...)
 			}
 			break
 		}
@@ -404,7 +439,17 @@ func streamFromNode(ctx context.Context, compiled *Compiled, startNode string, i
 		current = next.target
 	}
 
-	return state, nil
+	return branchResult{finalState: state, updates: updates}, nil
+}
+
+// streamFromNode 는 streamFromNodeCollect 의 래퍼로, 최종 state만 필요한 호출자를 위해 존재한다.
+// invokeLoop의 runFromNode에 대응하며 GraphEvent 방출을 포함한다.
+func streamFromNode(ctx context.Context, compiled *Compiled, startNode string, initState State, stepOffset int, cfg config.RunConfig, opts streamLoopOpts) (State, error) {
+	res, err := streamFromNodeCollect(ctx, compiled, startNode, initState, stepOffset, cfg, opts)
+	if err != nil {
+		return nil, err
+	}
+	return res.finalState, nil
 }
 
 // emitEvent 는 GraphEvent를 out 채널로 방출한다.
@@ -567,15 +612,18 @@ func streamSubgraphLoop(ctx context.Context, compiled *Compiled, input State, cf
 			return subgraphResult{}, err
 		}
 
+		// Fanout 처리: raw 덮어쓰기 대신 updates를 applyReducers로 누적한다
+		// (SPEC §5.3, ANALYSIS §2.1, §2.2).
 		if len(next.sends) > 0 {
 			for _, se := range next.sends {
 				childOpts := opts
-				branchState, branchErr := streamFromNode(ctx, compiled, se.target, se.state, step+1, cfg, childOpts)
+				br, branchErr := streamFromNodeCollect(ctx, compiled, se.target, se.state, step+1, cfg, childOpts)
 				if branchErr != nil {
 					return subgraphResult{}, fmt.Errorf("graph: 서브그래프 Stream Fanout 분기 %q 실행 실패: %w", se.target, branchErr)
 				}
-				for k, v := range branchState {
-					state[k] = v
+				// 분기 내 원본 업데이트를 순서대로 리듀서로 누적한다(ANALYSIS §2.2).
+				for _, u := range br.updates {
+					state = applyReducers(state, u, compiled.schema)
 				}
 			}
 			break
