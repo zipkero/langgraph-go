@@ -4,12 +4,14 @@
 //     agent·graph·graph/command·vectorstore·multiagent 를 의존하지 않는다.
 //   - 하위 패키지(tool·llm·config·core·checkpoint·message·structured 등)는 store 를 역참조하지 않는다.
 //
-// multiagent/import_boundary_test.go 와 동일한 go list -deps 방식을 따른다.
+// go/build 로 모듈 내부 소스를 정적 파싱한다. 런타임에 `go list` 같은 하위 프로세스를 띄우지 않으므로
+// 빌드 캐시 잠금·안티바이러스 행위탐지(temp 실행파일이 자식 프로세스 spawn)로 인한 비정상 종료(exit 259)가 없다.
 package store_test
 
 import (
-	"bytes"
-	"os/exec"
+	"go/build"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -17,24 +19,63 @@ import (
 
 const storeModPath = "github.com/zipkero/langgraph-go"
 
-// storeListDeps 는 pkg 의 전이적 의존 패키지 목록을 반환한다.
-// go list -deps 를 실행해 결과 줄을 슬라이스로 돌려준다.
+// storeModuleRoot 는 작업 디렉터리에서 위로 올라가며 go.mod 가 있는 모듈 루트를 찾는다.
+func storeModuleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("작업 디렉터리 조회 실패: %v", err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("go.mod 를 찾지 못했습니다")
+		}
+		dir = parent
+	}
+}
+
+// storePkgDir 는 모듈 내부 import 경로를 디스크 디렉터리로 변환한다.
+func storePkgDir(root, importPath string) string {
+	rel := strings.TrimPrefix(importPath, storeModPath)
+	rel = strings.TrimPrefix(rel, "/")
+	return filepath.Join(root, filepath.FromSlash(rel))
+}
+
+// storeIsInternal 은 import 경로가 이 모듈 내부 패키지인지 판별한다.
+func storeIsInternal(importPath string) bool {
+	return importPath == storeModPath || strings.HasPrefix(importPath, storeModPath+"/")
+}
+
+// storeListDeps 는 pkg 의 전이적 의존 중 모듈 내부 패키지 목록(pkg 자신 포함)을 반환한다.
+// go/build 로 모듈 내부 소스만 재귀 파싱하며, 외부/표준 라이브러리 import는 따라가지 않는다(서브프로세스 없음).
 func storeListDeps(t *testing.T, pkg string) []string {
 	t.Helper()
-	cmd := exec.Command("go", "list", "-deps", pkg)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("go list -deps %s 실패: %v\n출력: %s", pkg, err, out.String())
-	}
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	result := make([]string, 0, len(lines))
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if l != "" {
-			result = append(result, l)
+	root := storeModuleRoot(t)
+	visited := map[string]bool{}
+	var walk func(p string)
+	walk = func(p string) {
+		if visited[p] {
+			return
 		}
+		visited[p] = true
+		bp, err := build.ImportDir(storePkgDir(root, p), 0)
+		if err != nil {
+			t.Fatalf("%s 정적 파싱 실패: %v", p, err)
+		}
+		for _, imp := range bp.Imports {
+			if storeIsInternal(imp) {
+				walk(imp)
+			}
+		}
+	}
+	walk(pkg)
+	result := make([]string, 0, len(visited))
+	for p := range visited {
+		result = append(result, p)
 	}
 	return result
 }
