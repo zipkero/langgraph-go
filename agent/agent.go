@@ -477,40 +477,71 @@ func (a *Agent) runModel(ctx context.Context, st State, cfg config.RunConfig) (m
 	return aiMsg, nil
 }
 
-// runModelStream 은 스트리밍 모드에서 모델을 호출하고 토큰 이벤트를 ch 에 방출하며
-// 완성된 AI 메시지와 토큰 수를 반환한다.
+// runModelStream 은 스트리밍 모드에서 미들웨어 체인을 거쳐 모델을 호출하고
+// 토큰 이벤트를 ch 에 방출하며 완성된 AI 메시지와 토큰 수를 반환한다.
+// runModel(Invoke 경로)과 동일하게 BeforeModel·DynamicPrompt·Override 로 확정된
+// ModelRequest 로 스트림을 호출하고, 스트림 종료 후 최종 응답을 WrapModelCall
+// 체인의 응답 가공부에 통과시켜 최종 메시지를 확정한다(옵션 B, ANALYSIS §1.4).
+// BeforeModel 이 차단하면 스트림 호출 전에 에러가 반환되므로 토큰은 방출되지 않는다.
 func (a *Agent) runModelStream(ctx context.Context, st State, cfg config.RunConfig, ch chan<- AgentEvent, mode core.Mode) (message.Message, int, error) {
-	msgs := a.buildMessages(st.Messages, a.cfg.SystemPrompt)
-
-	events, err := a.boundModel.ChatStream(ctx, llm.ChatRequest{
-		Messages: msgs,
-	})
-	if err != nil {
-		return message.Message{}, 0, err
-	}
-
-	var aiMsg message.Message
 	tokenCount := 0
-	for ev := range events {
-		switch ev.Type {
-		case llm.ChatEventToken:
-			tokenCount++
-			if mode == core.ModeMessages || mode == core.ModeDebug {
-				ch <- AgentEvent{
-					Node:  "agent",
-					Token: ev.Token,
+
+	// 체인의 터미널 핸들러: 확정된 요청으로 ChatStream 을 호출해 토큰을 원본대로
+	// 방출하고, ChatEventDone 의 최종 ChatResponse 를 ModelResponse 로 반환한다.
+	// 이 반환값이 바깥쪽 WrapModelCall 들의 응답 가공 대상이 된다.
+	terminal := func(ctx context.Context, req middleware.ModelRequest) (middleware.ModelResponse, error) {
+		model := req.Model
+		if model == nil {
+			model = a.boundModel
+		}
+
+		msgs := a.buildMessages(st.Messages, req.SystemPrompt)
+
+		events, err := model.ChatStream(ctx, llm.ChatRequest{
+			Messages: msgs,
+		})
+		if err != nil {
+			return middleware.ModelResponse{}, err
+		}
+
+		var finalResp llm.ChatResponse
+		for ev := range events {
+			switch ev.Type {
+			case llm.ChatEventToken:
+				tokenCount++
+				if mode == core.ModeMessages || mode == core.ModeDebug {
+					ch <- AgentEvent{
+						Node:  "agent",
+						Token: ev.Token,
+					}
+				}
+			case llm.ChatEventDone:
+				if ev.Response != nil {
+					finalResp = *ev.Response
 				}
 			}
-		case llm.ChatEventMessage:
-			if ev.Message != nil {
-				aiMsg = *ev.Message
-			}
-		case llm.ChatEventDone:
-			if ev.Response != nil && len(ev.Response.ToolCalls) > 0 {
-				aiMsg = message.NewAssistantToolCalls(ev.Response.ToolCalls)
-				aiMsg.Content = ev.Response.Message.Content
-			}
 		}
+
+		return middleware.ModelResponse{Response: finalResp}, nil
+	}
+
+	req := middleware.ModelRequest{
+		State:        st.toCoreState(),
+		Model:        a.boundModel,
+		SystemPrompt: a.cfg.SystemPrompt,
+	}
+
+	handler := a.middlewareChain.Handler(terminal)
+	resp, err := handler(ctx, req)
+	if err != nil {
+		return message.Message{}, tokenCount, err
+	}
+
+	// tool_calls 가 있으면 ToolCalls 필드를 포함한 메시지로 구성(runModel 과 동일)
+	aiMsg := resp.Response.Message
+	if len(resp.Response.ToolCalls) > 0 {
+		aiMsg = message.NewAssistantToolCalls(resp.Response.ToolCalls)
+		aiMsg.Content = resp.Response.Message.Content
 	}
 
 	return aiMsg, tokenCount, nil

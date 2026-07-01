@@ -126,7 +126,7 @@ func validateReachability(b *Builder) error {
 }
 
 // buildAdjacency 는 빌더의 엣지 정보로 인접 리스트를 만든다.
-// 조건 엣지의 mapping 값도 인접 노드로 포함한다.
+// 조건 엣지의 mapping 값과 노드의 WithDestinations 선언도 인접 노드로 포함한다.
 func buildAdjacency(b *Builder) map[string][]string {
 	adj := make(map[string][]string)
 
@@ -145,6 +145,11 @@ func buildAdjacency(b *Builder) map[string][]string {
 		for _, target := range ce.mapping {
 			adj[ce.from] = append(adj[ce.from], target)
 		}
+	}
+
+	// WithDestinations 선언(command.Goto로 이동 가능한 노드)도 인접으로 취급
+	for name, ne := range b.nodes {
+		adj[name] = append(adj[name], ne.destinations...)
 	}
 
 	return adj

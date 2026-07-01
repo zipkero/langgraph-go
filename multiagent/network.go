@@ -68,34 +68,6 @@ func BuildNetwork(workers []Worker) (*graph.Compiled, error) {
 		}
 	}
 
-	// validate 의 BFS 도달 가능성 검사를 통과하기 위해, 각 워커 노드에서
-	// 다른 모든 워커 노드로 조건 엣지를 추가한다.
-	// 실제 실행에서는 NodeFunc 이 command.Goto(또는 End)를 반환하므로
-	// resolveNext 가 Command 처리(1단계)에서 반환하며, 조건 엣지는 실행되지 않는다.
-	// 이 조건 엣지는 validate 의 도달 가능성 검사를 통과하기 위한 구조 선언이다.
-	if len(workers) > 1 {
-		// 모든 라우터 반환값을 동일한 이름의 노드로 매핑하는 더미 라우터.
-		// NodeFunc 이 항상 Command 를 반환하므로 이 라우터는 실제로 호출되지 않는다.
-		// validate 의 BFS 도달 가능성 검사를 통과하기 위한 구조 선언이다.
-		dummyRouter := func(_ context.Context, _ graph.State) string { return "" }
-
-		for _, w := range workers {
-			// 자기 자신을 제외한 다른 워커들로의 조건 엣지를 추가해 BFS 가 도달 가능으로 판단하게 한다.
-			otherMapping := make(map[string]string, len(names)-1)
-			for _, n := range names {
-				if n != w.Name() {
-					otherMapping[n] = n
-				}
-			}
-			if len(otherMapping) == 0 {
-				continue
-			}
-			if err := b.AddConditionalEdges(w.Name(), dummyRouter, otherMapping); err != nil {
-				return nil, fmt.Errorf("multiagent: BuildNetwork — 조건 엣지 등록 실패(%q): %w", w.Name(), err)
-			}
-		}
-	}
-
 	// 첫 번째 워커를 진입점으로 설정한다.
 	// 빈 목록인 경우 SetEntryPoint 를 호출하지 않으므로
 	// Compile validate 에서 "진입점이 설정되지 않았습니다" 에러가 발생한다.

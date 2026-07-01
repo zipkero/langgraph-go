@@ -7,7 +7,7 @@ WithDestinations 도달성, agent.Stream 미들웨어 적용)를 바로잡고, n
 ## 상태
 - [x] SPEC
 - [x] ANALYSIS
-- [ ] IMPLEMENT
+- [x] IMPLEMENT
 
 ## 문서
 - [spec.md](./spec.md)
@@ -18,3 +18,4 @@ WithDestinations 도달성, agent.Stream 미들웨어 적용)를 바로잡고, n
 - 2026-06-30: SPEC 작성
 - 2026-06-30: ANALYSIS 작성 (Send/Fanout 리듀서 병합·도달성 destinations·agent.Stream 미들웨어 3개 의미 교정 설계, WrapModelCall 스트리밍은 옵션 B 채택)
 - 2026-06-30: IMPLEMENT 체크리스트 작성
+- 2026-07-01: task-004~007 구현·verify 완료 (fanout 일관성 e2e, 도달성 destinations, network 더미 엣지 제거, agent.Stream 미들웨어 경유)

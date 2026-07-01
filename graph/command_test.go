@@ -42,20 +42,8 @@ func TestInvoke_Goto_대상노드이동_update적용(t *testing.T) {
 	if err := b.AddNode("target", targetNode); err != nil {
 		t.Fatalf("AddNode target 실패: %v", err)
 	}
-	// start에서 target으로의 조건엣지/정적엣지 없음 — Goto로만 이동
-	// Compile 검증을 통과하기 위해 target도 start에서 도달 가능해야 하므로
-	// 보조 엣지 없이 WithDestinations 선언만으로 컴파일 검증을 통과해야 한다.
-	// validate.go는 정적/조건 엣지 기반 도달 불가 검사를 하므로, target에 도달하는
-	// 정적 엣지가 없으면 compile 실패가 된다. 이를 해결하기 위해 직접 엣지를 추가하거나
-	// Goto 대상을 도달 가능 그래프에 포함시켜야 한다. 여기서는 AddEdge로 target에
-	// 도달 가능하게 구성한다(실제 실행 경로와 무관, 검증 통과용).
-	// → 컴파일러가 정적 그래프 구조만 보므로 AddEdge 없이 단일 노드로 구성하는 대신
-	//   start의 WithDestinations + AddEdge 없이는 compile이 실패한다.
-	//   실용적 설계: Goto 대상을 정적 엣지로도 선언하거나, target을 start에서 직접 연결.
-	//   이 테스트에서는 AddEdge를 추가해 Compile을 통과시키되, 실제 실행은 Goto가 담당.
-	if err := b.AddEdge("start", "target"); err != nil {
-		t.Fatalf("AddEdge 실패: %v", err)
-	}
+	// start에서 target으로의 조건엣지/정적엣지 없음 — WithDestinations 선언만으로
+	// 도달성 검사를 통과하고, 실제 이동은 Goto가 담당한다.
 	if err := b.SetEntryPoint("start"); err != nil {
 		t.Fatalf("SetEntryPoint 실패: %v", err)
 	}

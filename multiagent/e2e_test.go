@@ -337,19 +337,6 @@ func TestE2E_SupervisorWorkerRouting(t *testing.T) {
 		t.Fatalf("번역→수퍼바이저 엣지 추가 실패: %v", err)
 	}
 
-	// validate BFS 도달 가능성 확보:
-	// WithDestinations 는 실행 시 Goto 허용 목적지이지만 BFS 인접 목록에는 포함되지 않는다.
-	// 수퍼바이저 → 워커 방향을 BFS 가 탐색하도록 dummy 조건 엣지를 추가한다.
-	// 실제 실행은 supervisorNode 가 command.Command(Goto) 를 반환하므로 이 조건 엣지는 호출되지 않는다.
-	dummyRouter := func(_ context.Context, _ graph.State) string { return "" }
-	routerMapping := map[string]string{
-		weatherWorker.Name():     weatherWorker.Name(),
-		translationWorker.Name(): translationWorker.Name(),
-	}
-	if err := b.AddConditionalEdges("supervisor", dummyRouter, routerMapping); err != nil {
-		t.Fatalf("수퍼바이저 조건 엣지 추가 실패: %v", err)
-	}
-
 	// 진입점 설정
 	if err := b.SetEntryPoint("supervisor"); err != nil {
 		t.Fatalf("진입점 설정 실패: %v", err)

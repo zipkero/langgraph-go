@@ -41,7 +41,7 @@
     - 확인: Stream fanout 회귀 테스트에서 누적 키 보존을 확인한다. `go test ./graph/...` 통과.
   - 참조: SPEC §5.3 / ANALYSIS §1.1, §2.1
 
-- [ ] task-004: Fanout 병합 일관성 e2e 검증
+- [x] task-004: Fanout 병합 일관성 e2e 검증
   - 목적: 분기 병합·격리 의미가 Invoke·Stream·subgraph 세 경로에서 동일하게 관찰됨을 한 시나리오로 교차 검증한다.
   - 접근: 같은 fanout 그래프(두 Send 분기가 `messages` 누적 키를 갱신, 입력은 fanout 직전 상태 기준)를 세 실행 경로로
     각각 구동해 최종 상태를 비교하는 e2e 테스트를 추가한다. 한 분기의 상태 쓰기가 같은 단계 다른 분기의 입력에 반영되지
@@ -52,7 +52,7 @@
     - 확인: 추가한 e2e 테스트와 기존 테스트가 모두 통과한다. `go test ./graph/... ./multiagent/...` 통과.
   - 참조: SPEC §5.1, §5.2, §5.3 / ANALYSIS §2.1, §2.2
 
-- [ ] task-005: 도달성 인접에 WithDestinations 포함
+- [x] task-005: 도달성 인접에 WithDestinations 포함
   - 목적: 정적 엣지·조건 엣지 없이 `command.Goto`(또는 노드 `WithDestinations` 선언)만으로 도달하는 노드가 Compile
     도달성 검사에서 거부되지 않게 한다.
   - 접근: `graph/validate.go`의 `buildAdjacency`에서 `b.nodes`를 순회해 각 `nodeEntry.destinations`를 `adj[name]`에
@@ -65,7 +65,7 @@
       Compile·Invoke가 통과하도록 정비한다. `go test ./graph/...` 통과.
   - 참조: SPEC §5.4 / ANALYSIS §1.2, §2.3
 
-- [ ] task-006: multiagent network 더미 조건엣지 제거
+- [x] task-006: multiagent network 더미 조건엣지 제거
   - 목적: 도달성 수정(task-005)의 결과로 불필요해진 multiagent network 그래프의 컴파일 통과용 더미 조건엣지를 제거한다.
   - 접근: `multiagent/network.go`의 `BuildNetwork`에서 워커가 2개 이상일 때 `dummyRouter`로 더미 조건 엣지를 추가하던
     블록을 제거하고, `dummyRouter` 변수와 관련 주석도 함께 제거한다. 워커 노드는 이미 `WithDestinations(names...)`를 선언하고
@@ -76,7 +76,7 @@
       확인한다. `go test ./multiagent/...` 통과.
   - 참조: SPEC §5.5 / ANALYSIS §1.3, §2.3, §4.2
 
-- [ ] task-007: agent.Stream 모델 호출을 미들웨어 체인 경유로
+- [x] task-007: agent.Stream 모델 호출을 미들웨어 체인 경유로
   - 목적: `agent.Stream`의 모델 호출이 `agent.Invoke`와 동일하게 `WrapModelCall`·`BeforeModel`·`DynamicPrompt`
     미들웨어 체인을 거치게 해, 동적 프롬프트 수정·before_model 차단·모델 오버라이드가 스트리밍 경로의 관찰 가능한 출력에
     반영되게 한다.

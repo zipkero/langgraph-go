@@ -710,6 +710,179 @@ func TestInvoke_BeforeModel_Block(t *testing.T) {
 }
 
 // ============================================================
+// 테스트: Stream — 미들웨어 체인 경유 (task-007)
+// ============================================================
+
+// TestStream_DynamicPrompt_AffectsTokensAndFinalMessage 는 DynamicPrompt 가 치환한
+// SystemPrompt 가 stub 의 ChatStream 호출에 반영됨(방출 토큰·최종 메시지에 반영)을 검증한다.
+// stub 은 요청 내용과 무관하게 고정 응답을 반환하므로, req.SystemPrompt 가 기대값으로
+// 확정되는지는 DynamicPrompt 내부에서 관찰해 검증한다(Invoke 경로의 검증 방식과 동일).
+func TestStream_DynamicPrompt_AffectsTokensAndFinalMessage(t *testing.T) {
+	var observedPrompt string
+	mw := middleware.DynamicPrompt(func(_ context.Context, req middleware.ModelRequest) (string, error) {
+		return "동적 프롬프트", nil
+	})
+	capture := middleware.WrapModelCall(func(ctx context.Context, req middleware.ModelRequest, next middleware.ModelHandler) (middleware.ModelResponse, error) {
+		observedPrompt = req.SystemPrompt
+		return next(ctx, req)
+	})
+
+	stub := llm.NewStubClient("stub", llm.StubResponse{
+		Message:      message.NewAssistantMessage("스트림 응답"),
+		FinishReason: "stop",
+	})
+	a, _ := Create(stub, nil, WithMiddleware(mw, capture))
+
+	in := Input{Messages: []message.Message{message.NewUserMessage("안녕")}}
+	ch, err := a.Stream(context.Background(), in, config.RunConfig{}, core.ModeMessages)
+	if err != nil {
+		t.Fatalf("Stream 실패: %v", err)
+	}
+
+	var tokens []string
+	var lastEvent AgentEvent
+	for ev := range ch {
+		if ev.Token != "" {
+			tokens = append(tokens, ev.Token)
+		}
+		lastEvent = ev
+	}
+
+	if observedPrompt != "동적 프롬프트" {
+		t.Errorf("DynamicPrompt 가 확정한 SystemPrompt=%q, 기대값=%q", observedPrompt, "동적 프롬프트")
+	}
+	if len(tokens) == 0 {
+		t.Error("토큰이 방출되지 않았습니다")
+	}
+	if !lastEvent.IsTaskComplete {
+		t.Error("마지막 이벤트의 IsTaskComplete=false")
+	}
+	if lastEvent.Content != "스트림 응답" {
+		t.Errorf("최종 메시지=%q, 기대값=%q", lastEvent.Content, "스트림 응답")
+	}
+}
+
+// TestStream_BeforeModel_Block_NoTokens 는 BeforeModel 이 차단하면 Stream 경로에서
+// 토큰이 전혀 방출되지 않고 에러 이벤트로 조기 종료됨을 검증한다.
+func TestStream_BeforeModel_Block_NoTokens(t *testing.T) {
+	blockErr := errors.New("차단됨")
+	mw := middleware.BeforeModel("blocker", func(_ context.Context, _ core.State, _ middleware.Runtime) error {
+		return blockErr
+	})
+
+	stub := llm.NewStubClient("stub", llm.StubResponse{
+		Message: message.NewAssistantMessage("이 응답은 방출되면 안 됨"),
+	})
+	a, _ := Create(stub, nil, WithMiddleware(mw))
+
+	in := Input{Messages: []message.Message{message.NewUserMessage("차단 테스트")}}
+	ch, err := a.Stream(context.Background(), in, config.RunConfig{}, core.ModeMessages)
+	if err != nil {
+		t.Fatalf("Stream 실패: %v", err)
+	}
+
+	var events []AgentEvent
+	for ev := range ch {
+		events = append(events, ev)
+	}
+
+	if len(events) == 0 {
+		t.Fatal("차단 시에도 에러 이벤트가 최소 1개 방출돼야 합니다")
+	}
+	for _, ev := range events {
+		if ev.Token != "" {
+			t.Errorf("BeforeModel 차단 시 토큰이 방출되면 안 됩니다: %q", ev.Token)
+		}
+	}
+	last := events[len(events)-1]
+	if last.Error == nil {
+		t.Fatal("마지막 이벤트에 Error 가 있어야 합니다")
+	}
+}
+
+// TestStream_WrapModelCall_AffectsFinalMessage 는 WrapModelCall 이 스트림 종료 후
+// 최종 응답을 가공하면 그 결과가 Stream 의 최종 메시지·상태에 반영됨을 검증한다
+// (옵션 B — 토큰은 원본대로 방출되고, 최종 메시지만 가공된다).
+func TestStream_WrapModelCall_AffectsFinalMessage(t *testing.T) {
+	mw := middleware.WrapModelCall(func(ctx context.Context, req middleware.ModelRequest, next middleware.ModelHandler) (middleware.ModelResponse, error) {
+		resp, err := next(ctx, req)
+		if err != nil {
+			return resp, err
+		}
+		resp.Response.Message = message.NewAssistantMessage("가공된 응답")
+		return resp, nil
+	})
+
+	stub := llm.NewStubClient("stub", llm.StubResponse{
+		Message:      message.NewAssistantMessage("원본 응답"),
+		FinishReason: "stop",
+	})
+	a, _ := Create(stub, nil, WithMiddleware(mw))
+
+	in := Input{Messages: []message.Message{message.NewUserMessage("안녕")}}
+	ch, err := a.Stream(context.Background(), in, config.RunConfig{}, core.ModeMessages)
+	if err != nil {
+		t.Fatalf("Stream 실패: %v", err)
+	}
+
+	var tokens []string
+	var lastEvent AgentEvent
+	for ev := range ch {
+		if ev.Token != "" {
+			tokens = append(tokens, ev.Token)
+		}
+		lastEvent = ev
+	}
+
+	// 토큰은 원본대로 방출된다(옵션 B의 트레이드오프)
+	if len(tokens) == 0 || tokens[0] != "원본 응답" {
+		t.Errorf("방출 토큰=%v, 원본 응답(\"원본 응답\") 포함 기대", tokens)
+	}
+	// 최종 메시지는 WrapModelCall 가공 결과로 확정된다
+	if !lastEvent.IsTaskComplete {
+		t.Error("마지막 이벤트의 IsTaskComplete=false")
+	}
+	if lastEvent.Content != "가공된 응답" {
+		t.Errorf("최종 메시지=%q, 기대값=%q(WrapModelCall 가공 반영)", lastEvent.Content, "가공된 응답")
+	}
+}
+
+// TestStream_EmptyChain_Unchanged 는 미들웨어를 쓰지 않는 호출(빈 Chain)에서
+// Stream 동작이 기존과 동일함을 확인한다.
+func TestStream_EmptyChain_Unchanged(t *testing.T) {
+	stub := llm.NewStubClient("stub", llm.StubResponse{
+		Message:      message.NewAssistantMessage("변경 없음"),
+		FinishReason: "stop",
+	})
+	a, _ := Create(stub, nil)
+
+	in := Input{Messages: []message.Message{message.NewUserMessage("안녕")}}
+	ch, err := a.Stream(context.Background(), in, config.RunConfig{}, core.ModeMessages)
+	if err != nil {
+		t.Fatalf("Stream 실패: %v", err)
+	}
+
+	var tokens []string
+	var lastEvent AgentEvent
+	for ev := range ch {
+		if ev.Token != "" {
+			tokens = append(tokens, ev.Token)
+		}
+		lastEvent = ev
+	}
+
+	if len(tokens) == 0 || tokens[0] != "변경 없음" {
+		t.Errorf("방출 토큰=%v, 기대값에 \"변경 없음\" 포함", tokens)
+	}
+	if !lastEvent.IsTaskComplete {
+		t.Error("마지막 이벤트의 IsTaskComplete=false")
+	}
+	if lastEvent.Content != "변경 없음" {
+		t.Errorf("최종 메시지=%q, 기대값=%q", lastEvent.Content, "변경 없음")
+	}
+}
+
+// ============================================================
 // 테스트: GetState
 // ============================================================
 
