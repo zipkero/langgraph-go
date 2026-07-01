@@ -174,7 +174,7 @@ func TestStubClient_BindTools_Immutable(t *testing.T) {
 	}
 }
 
-// ─── Structured / ResponseFormat 테스트 ──────────────────────────────────────
+// ─── Structured 테스트 ──────────────────────────────────────────────────────
 
 // testOutput 은 구조화 출력 테스트용 타입이다.
 type testOutput struct {

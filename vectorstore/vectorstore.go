@@ -188,10 +188,10 @@ type storeOptions struct {
 // FromDocuments 는 docs 를 emb 로 임베딩해 InMemoryStore 에 색인하고 Store 를 반환한다.
 // opts 는 스토어 생성 옵션으로, 현재는 확장 자리만 있다(SPEC §5.5, D3).
 func FromDocuments(ctx context.Context, docs []document.Document, emb llm.EmbeddingClient, opts ...StoreOption) (Store, error) {
-	// 옵션 적용 (현재 옵션 없음, 확장 자리)
-	_ = &storeOptions{}
+	// 옵션 적용 — 단일 인스턴스를 만들어 전달된 모든 옵션을 누적 적용한다.
+	o := &storeOptions{}
 	for _, opt := range opts {
-		opt(&storeOptions{})
+		opt(o)
 	}
 
 	store := newInMemoryStore(emb)

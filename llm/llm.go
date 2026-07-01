@@ -13,27 +13,6 @@ import (
 	"github.com/zipkero/langgraph-go/tool"
 )
 
-// ResponseFormatType 은 응답 출력 형식 종류를 나타내는 명명된 문자열 타입이다.
-type ResponseFormatType string
-
-const (
-	// ResponseFormatText 는 일반 텍스트 응답 형식이다.
-	ResponseFormatText ResponseFormatType = "text"
-	// ResponseFormatJSONObject 는 JSON 객체 응답 형식이다.
-	ResponseFormatJSONObject ResponseFormatType = "json_object"
-	// ResponseFormatJSONSchema 는 스키마 강제 JSON 응답 형식이다.
-	ResponseFormatJSONSchema ResponseFormatType = "json_schema"
-)
-
-// ResponseFormat 은 모델 응답의 출력 형식을 지정한다.
-type ResponseFormat struct {
-	// Type 은 응답 형식 종류다(text/json_object/json_schema).
-	Type ResponseFormatType
-	// Schema 는 json_schema 형식일 때 강제할 JSON 스키마다.
-	// Type 이 ResponseFormatJSONSchema 이면 이 필드를 채운다.
-	Schema *structured.Schema
-}
-
 // TokenUsage 는 단일 요청에서 소비된 토큰 수를 담는다.
 type TokenUsage struct {
 	// InputTokens 는 입력(프롬프트) 토큰 수다.
@@ -52,8 +31,6 @@ type ChatRequest struct {
 	Tools []tool.Schema
 	// ToolChoice 는 도구 선택 전략이다("auto", "none", 특정 도구 이름 등).
 	ToolChoice string
-	// ResponseFormat 은 응답 출력 형식이다.
-	ResponseFormat ResponseFormat
 	// Model 은 이 요청에 사용할 모델 이름이다. 비어 있으면 클라이언트 기본 모델을 쓴다.
 	Model string
 	// Temperature 는 샘플링 온도다. 0이면 기본값을 사용한다.

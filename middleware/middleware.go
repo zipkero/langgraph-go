@@ -28,8 +28,6 @@ type ModelRequest struct {
 	Model llm.Client
 	// SystemPrompt 는 이 요청의 시스템 프롬프트다.
 	SystemPrompt string
-	// Messages 는 이 요청의 대화 메시지 목록이다.
-	Messages []string
 }
 
 // Override 는 이 요청에 한해 다른 llm.Client 를 사용하도록 교체된 새 ModelRequest 를 반환한다.

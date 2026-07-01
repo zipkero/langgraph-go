@@ -30,9 +30,6 @@ type Checkpoint struct {
 	Metadata map[string]any
 	// CreatedAt 은 체크포인트가 생성된 시각이다.
 	CreatedAt time.Time
-	// ParentConfig 는 이 체크포인트를 생성한 직전 실행 설정이다.
-	// 첫 번째 체크포인트는 nil 이다.
-	ParentConfig *config.RunConfig
 }
 
 // Checkpointer 는 스레드 단위 체크포인트 저장소의 인터페이스다.
