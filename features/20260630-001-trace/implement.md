@@ -2,7 +2,7 @@
 
 `features/20260630-001-trace/spec.md` §5와 `analysis.md`로부터 도출한 순수 실행 체크리스트다. Task는 의존 순서대로 나열했다(위가 먼저).
 
-- [ ] task-001: 코어 타입과 기록·조회 표면 구현
+- [x] task-001: 코어 타입과 기록·조회 표면 구현
   - 목적: 한 run 단위로 노드 진입/종료·도구 호출/결과·LLM 요청/응답·에러를 시간순으로 기록하고, run 시작/종료 경계를
     표시하며, 기록한 이벤트를 호출 순서대로 돌려주는 인메모리 추적기를 만든다.
   - 접근: 신규 `trace/` 디렉토리에 자체 `Event`/`Trace` 타입을 정의한다. `Event`는 공통 메타(종류 판별 + 순서)를 담고
@@ -22,7 +22,7 @@
       오류 없이 끝나고 Phase 0~6 패키지 동작이 변하지 않음을 확인한다.
   - 참조: SPEC §5.2, §5.1; ANALYSIS §1, §3, Decision (a),(d).
 
-- [ ] task-002: JSON 내보내기와 round-trip 보존 구현
+- [x] task-002: JSON 내보내기와 round-trip 보존 구현
   - 목적: 기록된 이벤트를 JSON 바이트로 내보내고, 그 바이트를 다시 읽으면 각 이벤트의 종류와 필드 값이 보존되게 한다.
   - 접근: `(*Trace) ExportJSON() ([]byte, error)`를 §25 시그니처대로 구현한다. `Event`에 종류 판별 필드(`Kind`)를 두고
     비어 있는 종류 페이로드는 `omitempty`로 생략해, 표준 `encoding/json`만으로 `Kind`와 채워진 페이로드 값이 보존되도록
@@ -35,7 +35,7 @@
       구성)하는 round-trip 단위 테스트를 추가한다. `go test ./trace/`가 통과한다.
   - 참조: SPEC §5.3; ANALYSIS §2, Decision (a),(b).
 
-- [ ] task-003: pretty-print 텍스트 출력 구현
+- [x] task-003: pretty-print 텍스트 출력 구현
   - 목적: 기록된 trace를 사람이 읽는 텍스트로 렌더링해 run 구간과 모든 이벤트 종류(노드·도구·LLM·에러)가 식별
     가능하게 한다.
   - 접근: `(*Trace) Pretty() string`을 구현한다(error 미반환, 순수 문자열 생성, ANALYSIS Decision (c)). run 시작/종료
@@ -48,7 +48,7 @@
       추가한다. `go test ./trace/`가 통과한다.
   - 참조: SPEC §5.4; ANALYSIS §1, §2, Decision (c).
 
-- [ ] task-004: mermaid 노드 흐름 출력 구현
+- [x] task-004: mermaid 노드 흐름 출력 구현
   - 목적: 기록된 노드 실행 흐름을 mermaid 다이어그램 텍스트로 렌더링해 노드 진입/종료 순서가 mermaid 문법의 노드·
     엣지로 표현되게 한다.
   - 접근: `(*Trace) Mermaid() string`을 구현한다(error 미반환, 순수 문자열 생성, ANALYSIS Decision (c)). `NodeTrace`
@@ -61,7 +61,7 @@
       추가한다. `go test ./trace/`가 통과한다.
   - 참조: SPEC §5.5; ANALYSIS §1, §2, Decision (c).
 
-- [ ] task-005: tool.Event 싱크 구현과 자동 ToolTrace 기록
+- [x] task-005: tool.Event 싱크 구현과 자동 ToolTrace 기록
   - 목적: `tool.Runtime`의 이벤트 방출에 꽂을 수 있는 `func(tool.Event)` 싱크를 제공해, 도구가 이벤트를 방출하면 그
     호출/결과가 별도 수작업 호출 없이 `ToolTrace`로 자동 기록되게 한다.
   - 접근: `(*Trace) ToolEventSink() func(tool.Event)`를 구현해, `tool.Event`(ToolName/ToolCallID/Input/Result/Err)를
@@ -76,7 +76,7 @@
       오류 없이 끝남을 확인한다. `go test ./trace/`가 통과한다.
   - 참조: SPEC §5.6; ANALYSIS §1, §2, Decision (e).
 
-- [ ] task-006: import 경계 정적 검증 테스트 추가
+- [x] task-006: import 경계 정적 검증 테스트 추가
   - 목적: `trace`가 허용 패키지만 import하고 하위 패키지가 `trace`를 역참조하지 않음을 정적으로 확인하며, 이 경계를
     회귀로 보호한다.
   - 접근: `trace/import_boundary_test.go`를 기존 `a2a`/`mcp`/`store`의 `import_boundary_test.go` 방식대로 작성한다
