@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/zipkero/langgraph-go/config"
+	"github.com/zipkero/langgraph-go/graph"
 	"github.com/zipkero/langgraph-go/graph/command"
 	"github.com/zipkero/langgraph-go/message"
 	"github.com/zipkero/langgraph-go/tool"
@@ -184,4 +186,74 @@ func HandoffBackMessages(agentName, toolCallID, result string) []message.Message
 	toolMsg := message.NewToolMessage(toolCallID, agentName, result)
 
 	return []message.Message{aiMsg, toolMsg}
+}
+
+// HandoffToolNode 는 마지막 AI 메시지의 tool_calls 를 실행하고, 호출된 도구 중
+// HandoffTool 이 있으면 그 Command(부모 그래프 위임)를 그래프 엔진에 전파하는
+// graph.NodeFunc 를 반환한다. 핸드오프 도구가 없으면 ToolMessage 만 상태에 병합한다.
+// 도구가 command 를 도출하는 create_agent 내부 ToolNode 패턴(LangGraph 파이썬)의 Go 대응이며,
+// prebuilt.ToolNode 는 설계상 graph/command 를 참조하지 않으므로 Command 전파는 이 노드가 담당한다.
+// 도구 Runtime 은 호출마다 tool_call ID 와 그래프 실행이 ctx 에 주입한 RunConfig 로 구성한다.
+func HandoffToolNode(reg *tool.Registry) graph.NodeFunc {
+	exec := tool.NewExecutor(reg)
+	return func(ctx context.Context, st graph.State) (any, error) {
+		msgs := messagesFromState(st)
+		lastAI, ok := message.LastAIMessage(msgs)
+		if !ok {
+			return graph.StateUpdate{}, nil
+		}
+		calls := message.ExtractToolCalls(lastAI)
+		if len(calls) == 0 {
+			return graph.StateUpdate{}, nil
+		}
+
+		runCfg, _ := config.RunConfigFromContext(ctx)
+
+		// 도구 실행 — 실행 오류를 에러 ToolMessage 로 변환하는 규칙은 ExecuteMany 와 동일.
+		// 핸드오프 도구는 실행과 별개로 Command 도출용으로 수집한다(첫 번째 것 하나만 —
+		// 복수 tool_calls 의 병렬 위임은 HandoffTool.Command 가 state 의 tool_calls 수로 감지해
+		// Fanout 을 반환하므로 여기서 복수 Command 를 합치지 않는다).
+		var handoff HandoffTool
+		var handoffRT tool.Runtime
+		toolMsgs := make([]message.Message, 0, len(calls))
+		for _, call := range calls {
+			rt := tool.NewRuntime(map[string]any(st), string(call.ID), runCfg, nil, nil)
+
+			res, execErr := exec.Execute(ctx, call, rt)
+			if execErr != nil {
+				res = tool.Result{Content: execErr.Error(), IsError: true}
+			}
+			toolMsgs = append(toolMsgs, exec.BuildToolMessage(call, res))
+
+			if handoff == nil {
+				if t, found := reg.Get(call.Name); found {
+					if ht, isHandoff := t.(HandoffTool); isHandoff {
+						handoff = ht
+						handoffRT = rt
+					}
+				}
+			}
+		}
+
+		merged := message.AddMessages(msgs, toolMsgs)
+
+		// 핸드오프 도구가 없으면 일반 ToolNode 와 동일하게 메시지 병합만 반환한다.
+		if handoff == nil {
+			return graph.StateUpdate{"messages": merged}, nil
+		}
+
+		cmd, err := handoff.Command(handoffRT)
+		if err != nil {
+			return nil, fmt.Errorf("multiagent: HandoffToolNode — Command 도출 실패: %w", err)
+		}
+		// 도구 호출/응답 쌍이 부모 상태에 남도록 Update 에 병합 메시지를 싣는다.
+		// Command 가 자체 messages 업데이트를 지정했으면 그것을 우선한다.
+		if cmd.Update == nil {
+			cmd.Update = graph.StateUpdate{}
+		}
+		if _, exists := cmd.Update["messages"]; !exists {
+			cmd.Update["messages"] = merged
+		}
+		return cmd, nil
+	}
 }

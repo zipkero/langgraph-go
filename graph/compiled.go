@@ -34,6 +34,9 @@ type Compiled struct {
 // 진입점부터 정적 엣지를 따라 노드를 순차 실행하며, 각 노드의 StateUpdate를
 // 스키마의 필드별 리듀서(미등록 필드는 last-write-wins)로 병합한다(§2.1, §2.4 D4).
 func (c *Compiled) Invoke(ctx context.Context, input State, cfg config.RunConfig) (State, error) {
+	// 노드 함수가 시그니처 변경 없이 실행별 설정에 접근할 수 있도록 ctx 에 주입한다.
+	// 서브그래프 내부 경로는 이 진입점을 다시 거치지 않으므로 부모 주입값이 그대로 흐른다.
+	ctx = config.WithRunConfig(ctx, cfg)
 	return invokeLoop(ctx, c, input, cfg)
 }
 
@@ -49,6 +52,8 @@ func (c *Compiled) Invoke(ctx context.Context, input State, cfg config.RunConfig
 // WithSubgraphs() 옵션을 전달하면 서브그래프 이벤트의 GraphEvent.Path가 채워진다.
 // 서브그래프 노드는 AsStreamNode를 통해 자동으로 스트리밍 어댑터로 교체된다.
 func (c *Compiled) Stream(ctx context.Context, input State, cfg config.RunConfig, mode core.Mode, sopts ...StreamOption) (<-chan GraphEvent, error) {
+	// Invoke 와 동일하게 노드 함수용 실행별 설정을 ctx 에 주입한다.
+	ctx = config.WithRunConfig(ctx, cfg)
 	so := streamOptions{}
 	for _, opt := range sopts {
 		opt(&so)

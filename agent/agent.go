@@ -116,6 +116,10 @@ type Config struct {
 	Checkpointer checkpoint.Checkpointer
 	// Store 는 도구 실행 시 주입할 스토어 인터페이스다.
 	Store tool.Store
+	// ToolEventSink 는 도구 실행 이벤트를 수신할 싱크다(trace.ToolEventSink 등).
+	// nil 이 아니면 runTools 가 도구 호출 전(Result nil)·후(Result 채움) 이벤트를 방출하고,
+	// 도구 Runtime 의 Emit 으로도 주입돼 도구 내부 커스텀 방출을 같은 싱크로 받는다.
+	ToolEventSink func(tool.Event)
 	// ResponseFormat 은 종료 직전 구조화 응답을 생성하기 위한 스키마다.
 	// nil 이면 구조화 출력을 생성하지 않는다.
 	ResponseFormat *structured.Schema
@@ -163,6 +167,14 @@ func WithCheckpointer(cp checkpoint.Checkpointer) Option {
 func WithStore(s tool.Store) Option {
 	return func(c *Config) {
 		c.Store = s
+	}
+}
+
+// WithToolEventSink 는 도구 실행 이벤트 싱크를 지정하는 옵션이다.
+// trace.ToolEventSink() 반환 함수를 그대로 전달하면 도구 호출/결과가 자동 기록된다.
+func WithToolEventSink(sink func(tool.Event)) Option {
+	return func(c *Config) {
+		c.ToolEventSink = sink
 	}
 }
 
@@ -549,6 +561,10 @@ func (a *Agent) runModelStream(ctx context.Context, st State, cfg config.RunConf
 
 // runTools 는 마지막 AI 메시지의 tool_calls 를 tool.Executor 로 디스패치해
 // ToolMessage 목록을 반환한다.
+// 호출마다 해당 tool_call ID 를 담은 Runtime 을 새로 구성하고(도구가 rt.ToolCallID() 로
+// 자기 호출을 식별할 수 있도록), ToolEventSink 가 지정돼 있으면 호출 전(Result nil)·후(Result
+// 채움) 이벤트를 방출한다. 실행 오류를 에러 ToolMessage 로 변환하는 규칙은
+// tool.Executor.ExecuteMany 와 동일하다.
 func (a *Agent) runTools(ctx context.Context, st State, cfg config.RunConfig) ([]message.Message, error) {
 	lastAI, ok := message.LastAIMessage(st.Messages)
 	if !ok || !message.HasToolCalls(lastAI) {
@@ -556,10 +572,27 @@ func (a *Agent) runTools(ctx context.Context, st State, cfg config.RunConfig) ([
 	}
 
 	calls := message.ExtractToolCalls(lastAI)
-	rt := tool.NewRuntime(st.toCoreState(), "", cfg, a.cfg.Store, nil)
-	toolMsgs, err := a.executor.ExecuteMany(ctx, calls, rt)
-	if err != nil {
-		return nil, err
+	coreState := st.toCoreState()
+	sink := a.cfg.ToolEventSink
+
+	toolMsgs := make([]message.Message, 0, len(calls))
+	for _, call := range calls {
+		rt := tool.NewRuntime(coreState, string(call.ID), cfg, a.cfg.Store, sink)
+
+		if sink != nil {
+			sink(tool.Event{ToolName: call.Name, ToolCallID: string(call.ID), Input: tool.Input(call.Args)})
+		}
+
+		res, execErr := a.executor.Execute(ctx, call, rt)
+		if execErr != nil {
+			res = tool.Result{Content: execErr.Error(), IsError: true}
+		}
+
+		if sink != nil {
+			sink(tool.Event{ToolName: call.Name, ToolCallID: string(call.ID), Input: tool.Input(call.Args), Result: &res, Err: execErr})
+		}
+
+		toolMsgs = append(toolMsgs, a.executor.BuildToolMessage(call, res))
 	}
 	return toolMsgs, nil
 }

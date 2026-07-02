@@ -37,13 +37,43 @@ func getMessages(st core.State) []message.Message {
 	return msgs
 }
 
+// ToolNodeOption 은 NewToolNode 생성 옵션이다.
+type ToolNodeOption func(*toolNodeConfig)
+
+// toolNodeConfig 는 ToolNode 가 도구 Runtime 에 주입할 구성 요소를 담는다.
+type toolNodeConfig struct {
+	store tool.Store
+	sink  func(tool.Event)
+}
+
+// WithToolStore 는 도구 Runtime 에 주입할 스토어를 지정하는 옵션이다.
+func WithToolStore(s tool.Store) ToolNodeOption {
+	return func(c *toolNodeConfig) {
+		c.store = s
+	}
+}
+
+// WithToolEventSink 는 도구 실행 이벤트 싱크를 지정하는 옵션이다(trace.ToolEventSink 등).
+// 지정하면 도구 호출 전(Result nil)·후(Result 채움) 이벤트를 방출한다.
+func WithToolEventSink(sink func(tool.Event)) ToolNodeOption {
+	return func(c *toolNodeConfig) {
+		c.sink = sink
+	}
+}
+
 // NewToolNode 는 마지막 AI 메시지의 미처리 tool_calls 를 실행하고
 // ToolMessage 목록을 상태에 추가하는 NodeFunc 를 반환한다.
 // reg 에 등록된 도구를 이름으로 찾아 Executor 로 디스패치한다.
 // 상태의 "messages" 키에서 메시지를 읽고, StateUpdate 로 추가된 ToolMessage 를 반환한다.
 // 호출자/agent 가 리듀서(AddMessages)로 상태에 병합한다.
-func NewToolNode(reg *tool.Registry) NodeFunc {
+// 도구 Runtime 은 호출마다 새로 구성한다 — tool_call ID, 그래프 실행이 ctx 에 주입한
+// RunConfig(config.RunConfigFromContext), 옵션으로 지정한 store·이벤트 싱크를 전달한다.
+func NewToolNode(reg *tool.Registry, opts ...ToolNodeOption) NodeFunc {
 	exec := tool.NewExecutor(reg)
+	nodeCfg := toolNodeConfig{}
+	for _, opt := range opts {
+		opt(&nodeCfg)
+	}
 	return func(ctx context.Context, st core.State) (core.StateUpdate, error) {
 		msgs := getMessages(st)
 
@@ -59,9 +89,10 @@ func NewToolNode(reg *tool.Registry) NodeFunc {
 			return core.StateUpdate{}, nil
 		}
 
-		// 도구 실행 — Runtime은 nil store·no-op emit으로 최소 주입
-		rt := tool.NewRuntime(st, "", config.RunConfig{}, nil, nil)
-		toolMsgs, err := exec.ExecuteMany(ctx, toolCalls, rt)
+		// 그래프 진입점(Compiled.Invoke/Stream)이 주입한 실행별 설정. 없으면 zero value.
+		runCfg, _ := config.RunConfigFromContext(ctx)
+
+		toolMsgs, err := executeCalls(ctx, exec, toolCalls, st, runCfg, nodeCfg)
 		if err != nil {
 			return core.StateUpdate{}, fmt.Errorf("prebuilt.ToolNode: 도구 실행 실패: %w", err)
 		}
@@ -72,6 +103,32 @@ func NewToolNode(reg *tool.Registry) NodeFunc {
 			messagesKey: message.AddMessages(msgs, toolMsgs),
 		}, nil
 	}
+}
+
+// executeCalls 는 toolCalls 를 호출별 Runtime(tool_call ID·RunConfig·store·싱크)으로 실행해
+// ToolMessage 목록을 반환한다. 실행 오류를 에러 ToolMessage 로 변환하는 규칙은
+// tool.Executor.ExecuteMany 와 동일하다.
+func executeCalls(ctx context.Context, exec *tool.Executor, toolCalls []message.ToolCall, st core.State, runCfg config.RunConfig, nodeCfg toolNodeConfig) ([]message.Message, error) {
+	toolMsgs := make([]message.Message, 0, len(toolCalls))
+	for _, call := range toolCalls {
+		rt := tool.NewRuntime(st, string(call.ID), runCfg, nodeCfg.store, nodeCfg.sink)
+
+		if nodeCfg.sink != nil {
+			nodeCfg.sink(tool.Event{ToolName: call.Name, ToolCallID: string(call.ID), Input: tool.Input(call.Args)})
+		}
+
+		res, execErr := exec.Execute(ctx, call, rt)
+		if execErr != nil {
+			res = tool.Result{Content: execErr.Error(), IsError: true}
+		}
+
+		if nodeCfg.sink != nil {
+			nodeCfg.sink(tool.Event{ToolName: call.Name, ToolCallID: string(call.ID), Input: tool.Input(call.Args), Result: &res, Err: execErr})
+		}
+
+		toolMsgs = append(toolMsgs, exec.BuildToolMessage(call, res))
+	}
+	return toolMsgs, nil
 }
 
 // HasPendingToolCalls 는 상태의 마지막 AI 메시지에 미처리 tool_calls 가 있는지 반환한다.
