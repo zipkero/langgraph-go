@@ -170,9 +170,11 @@ func InitChatModel(spec string, opts ...Option) (Client, error) {
 	switch ps.provider {
 	case "anthropic":
 		return newAnthropicClient(ps.model, o)
+	case "openai":
+		return newOpenAIClient(ps.model, o)
 	default:
 		return nil, fmt.Errorf(
-			"llm: 지원하지 않는 프로바이더 %q — 현재는 \"anthropic\" 만 지원합니다",
+			"llm: 지원하지 않는 프로바이더 %q — 현재는 \"anthropic\", \"openai\" 만 지원합니다",
 			ps.provider,
 		)
 	}

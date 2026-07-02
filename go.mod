@@ -8,6 +8,7 @@ require (
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/nguyenthenguyen/docx v0.0.0-20230621112118-9c8e795a11db
+	github.com/openai/openai-go v1.12.0
 	github.com/pgvector/pgvector-go v0.4.0
 	github.com/pgvector/pgvector-go/pgx v0.4.0
 	golang.org/x/net v0.56.0

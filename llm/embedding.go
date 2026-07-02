@@ -60,9 +60,11 @@ func InitEmbeddings(spec string, opts ...Option) (EmbeddingClient, error) {
 		// apiKey 필드를 베이스 URL 주입에 사용하지 않고, WithBaseURL 이 없으므로
 		// clientOptions 에 baseURL 이 없다 — 기본값을 사용한다.
 		return newOllamaEmbeddingClient(model, defaultOllamaBaseURL), nil
+	case "openai":
+		return newOpenAIEmbeddingClient(model, o)
 	default:
 		return nil, fmt.Errorf(
-			"llm: 지원하지 않는 임베딩 프로바이더 %q — 현재는 \"ollama\" 만 지원합니다",
+			"llm: 지원하지 않는 임베딩 프로바이더 %q — 현재는 \"ollama\", \"openai\" 만 지원합니다",
 			ps.provider,
 		)
 	}

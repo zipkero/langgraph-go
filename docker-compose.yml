@@ -1,0 +1,13 @@
+# 로컬 실습 인프라. Postgres 경로는 Supabase 클라우드(DATABASE_URL)를 기준으로 하므로
+# 여기에는 외부 서버가 필요한 Chroma 벡터스토어만 둔다 (vectorstore/chroma.go, 기본 localhost:8000).
+services:
+  chroma:
+    image: chromadb/chroma
+    container_name: chroma
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma-data:/data
+
+volumes:
+  chroma-data:

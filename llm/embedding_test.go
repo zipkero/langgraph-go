@@ -36,7 +36,6 @@ func TestInitEmbeddings_InvalidFormat(t *testing.T) {
 // TestInitEmbeddings_UnsupportedProvider 는 미지원 프로바이더가 에러를 반환하는지 검증한다.
 func TestInitEmbeddings_UnsupportedProvider(t *testing.T) {
 	unsupported := []string{
-		"openai:text-embedding-3-small",
 		"anthropic:claude-3",
 		"gemini:embedding-001",
 		"cohere:embed-english-v3",
@@ -46,6 +45,18 @@ func TestInitEmbeddings_UnsupportedProvider(t *testing.T) {
 		if err == nil {
 			t.Errorf("미지원 프로바이더 %q 에 에러가 반환되지 않음", spec)
 		}
+	}
+}
+
+// TestInitEmbeddings_OpenAIProvider 는 openai 프로바이더가 파싱돼 지원 상태로 반환되는지 검증한다.
+// InitEmbeddings 는 네트워크를 타지 않으므로 OPENAI_API_KEY 부재 환경에서도 생성이 성공해야 한다.
+func TestInitEmbeddings_OpenAIProvider(t *testing.T) {
+	client, err := llm.InitEmbeddings("openai:text-embedding-3-small")
+	if err != nil {
+		t.Fatalf("openai 는 지원 provider 인데 에러 반환: %v", err)
+	}
+	if client == nil {
+		t.Fatal("InitEmbeddings 가 nil 을 반환함")
 	}
 }
 

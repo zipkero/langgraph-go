@@ -2,9 +2,10 @@
 -- database 패키지는 이 스키마가 이미 존재한다고 가정해 호출만 한다(DDL·마이그레이션 미소유, client.go).
 -- 이 파일은 코드가 실행하지 않는 참고 자산이며, Supabase SQL Editor에서 1회 수동 실행해 적용한다.
 --
--- hanbit-aiagent 교재(CHAP11) index.sql의 개정판이다. 원본은 OpenAI text-embedding-3-small 기준
--- VECTOR(1536)이지만, 이 레포의 임베딩은 Ollama nomic-embed-text(llm.InitEmbeddings 기본값)라
--- 차원을 768로 바꿨다. 다른 임베딩 모델을 쓰면 아래 vector(768) 세 곳을 그 모델 차원으로 맞춘다.
+-- hanbit-aiagent 교재(CHAP11) index.sql 원본과 동일하게 OpenAI text-embedding-3-small 기준
+-- VECTOR(1536)이다. 다른 임베딩 모델을 쓰면 아래 vector(1536) 세 곳을 그 모델 차원으로 맞춘다.
+-- 기존에 vector(768) 스키마를 적용했다면 documents 테이블과 match_documents 함수를 drop 한 뒤
+-- 이 파일을 재실행한다(차원 변경 시 기존 임베딩 데이터는 재적재가 필요하다).
 --
 -- 컬럼 계약은 database/query.go 와 1:1 이다:
 --   documents        → documentColumns  (content, embedding, filename, storage_ref, chunk_index, document_type)
@@ -33,7 +34,7 @@ create index if not exists web_content_title_tsv_idx
 create table if not exists documents (
     id            bigserial primary key,
     content       text not null,
-    embedding     vector(768),
+    embedding     vector(1536),
     filename      text not null default '',
     storage_ref   text not null default '',
     chunk_index   int  not null default 0,
@@ -49,12 +50,12 @@ create index if not exists documents_embedding_idx
 -- database.MatchDocuments 가 "SELECT ... FROM match_documents($1, $2)" 로 호출한다.
 -- 반환 컬럼은 documentColumns 와 이름·순서·타입이 일치해야 한다.
 create or replace function match_documents(
-    query_embedding vector(768),
+    query_embedding vector(1536),
     match_count     int
 )
 returns table (
     content       text,
-    embedding     vector(768),
+    embedding     vector(1536),
     filename      text,
     storage_ref   text,
     chunk_index   int,

@@ -286,9 +286,18 @@ func TestInitChatModel_AnthropicProvider(t *testing.T) {
 	}
 }
 
+// TestInitChatModel_OpenAIProvider 는 openai provider 가 파싱돼 지원 상태로 반환되는지 검증한다.
+// InitChatModel 은 네트워크를 타지 않으므로 OPENAI_API_KEY 부재 환경에서도 생성이 성공해야 한다.
+func TestInitChatModel_OpenAIProvider(t *testing.T) {
+	_, err := llm.InitChatModel("openai:gpt-4o-mini")
+	if err != nil {
+		t.Fatalf("openai 는 지원 provider 인데 에러 반환: %v", err)
+	}
+}
+
 // TestInitChatModel_UnsupportedProvider 는 미지원 provider 가 에러를 반환하는지 검증한다.
 func TestInitChatModel_UnsupportedProvider(t *testing.T) {
-	_, err := llm.InitChatModel("openai:gpt-4o")
+	_, err := llm.InitChatModel("gemini:gemini-pro")
 	if err == nil {
 		t.Fatal("미지원 provider 에 에러가 반환되지 않음")
 	}
@@ -313,7 +322,6 @@ func TestInitChatModel_InvalidFormat(t *testing.T) {
 // TestInitChatModel_MultipleProviders 는 다양한 미지원 provider 가 에러를 반환하는지 검증한다.
 func TestInitChatModel_MultipleProviders(t *testing.T) {
 	unsupported := []string{
-		"openai:gpt-4o",
 		"gemini:gemini-pro",
 		"cohere:command-r",
 		"ollama:llama3",
