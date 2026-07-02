@@ -245,6 +245,8 @@ func (c *openaiClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse,
 // SSE 델타는 ChatEventToken 으로, 완성 메시지는 ChatEventMessage, 종료는 ChatEventDone 으로 방출한다.
 func (c *openaiClient) ChatStream(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error) {
 	params := c.buildParams(req)
+	// OpenAI 는 StreamOptions.IncludeUsage 를 켜야 스트림 마지막 chunk 에 usage 가 실린다(미설정 시 항상 0).
+	params.StreamOptions = openai.ChatCompletionStreamOptionsParam{IncludeUsage: openai.Bool(true)}
 	stream := c.client.Chat.Completions.NewStreaming(ctx, params)
 
 	ch := make(chan ChatEvent, 16)

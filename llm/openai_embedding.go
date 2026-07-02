@@ -58,14 +58,26 @@ func (c *openaiEmbeddingClient) Embed(ctx context.Context, texts []string) ([][]
 		return nil, fmt.Errorf("llm: OpenAI 임베딩 응답에 벡터가 없습니다")
 	}
 
-	// 응답의 Index 필드를 기준으로 입력 순서를 보존한다.
-	result := make([][]float32, len(resp.Data))
+	// 응답의 Index 필드를 기준으로 입력 순서를 보존한다. 개수·인덱스가 입력과 어긋난
+	// 비정상 응답은 잘못된 매핑(panic·조용한 누락)을 만들 수 있으므로 error 로 반환한다.
+	if len(resp.Data) != len(texts) {
+		return nil, fmt.Errorf("llm: OpenAI 임베딩 응답 개수 불일치: got %d, want %d", len(resp.Data), len(texts))
+	}
+	result := make([][]float32, len(texts))
 	for _, d := range resp.Data {
+		if d.Index < 0 || int(d.Index) >= len(texts) {
+			return nil, fmt.Errorf("llm: OpenAI 임베딩 응답 인덱스가 범위 밖입니다: %d", d.Index)
+		}
 		vec := make([]float32, len(d.Embedding))
 		for i, v := range d.Embedding {
 			vec[i] = float32(v)
 		}
 		result[d.Index] = vec
+	}
+	for i, vec := range result {
+		if vec == nil {
+			return nil, fmt.Errorf("llm: OpenAI 임베딩 응답에 texts[%d] 벡터가 없습니다(중복 인덱스)", i)
+		}
 	}
 	return result, nil
 }

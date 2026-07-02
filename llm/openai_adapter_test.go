@@ -278,6 +278,9 @@ func TestOpenAIAdapter_LiveChatStream(t *testing.T) {
 			gotDone = true
 			if event.Response == nil {
 				t.Error("ChatEventDone 의 Response 가 nil 임")
+			} else if event.Response.Usage.OutputTokens <= 0 {
+				// StreamOptions.IncludeUsage 가 켜져 있어야 스트림 usage 가 집계된다.
+				t.Errorf("스트리밍 Done 의 OutputTokens 가 0 이하: %d", event.Response.Usage.OutputTokens)
 			}
 		}
 	}

@@ -7,6 +7,7 @@ package llm_test
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/zipkero/langgraph-go/llm"
@@ -85,6 +86,39 @@ func TestOpenAIEmbedding_LiveEmbed(t *testing.T) {
 			t.Errorf("texts[%d] 임베딩 차원 불일치: got %d, want 1536", i, len(vec))
 		}
 	}
+
+	// 입력 순서 보존 검증: 같은 텍스트를 단독 임베딩한 벡터는 배치 결과 중
+	// 같은 위치의 벡터와 가장 유사해야 한다.
+	for i, text := range texts {
+		q, err := client.EmbedQuery(context.Background(), text)
+		if err != nil {
+			t.Fatalf("EmbedQuery(texts[%d]) 실패: %v", i, err)
+		}
+		best, bestSim := -1, -2.0
+		for j, vec := range embeddings {
+			if sim := cosineSim(q, vec); sim > bestSim {
+				best, bestSim = j, sim
+			}
+		}
+		if best != i {
+			t.Errorf("입력 순서 불일치: texts[%d] 단독 임베딩이 embeddings[%d]와 가장 유사(sim=%.4f)",
+				i, best, bestSim)
+		}
+	}
+}
+
+// cosineSim 은 두 벡터의 코사인 유사도를 반환한다.
+func cosineSim(a, b []float32) float64 {
+	var dot, na, nb float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		na += float64(a[i]) * float64(a[i])
+		nb += float64(b[i]) * float64(b[i])
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }
 
 // TestOpenAIEmbedding_LiveEmbedQuery 는 라이브 EmbedQuery 가 1536차원 벡터를 반환하는지 검증한다.

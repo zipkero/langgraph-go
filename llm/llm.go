@@ -1,6 +1,6 @@
 // llm 패키지는 챗 모델 추상화, 도구 바인딩, 구조화/JSON 출력, 스트리밍을 담당한다.
-// message, tool, structured, core에 의존하며, Anthropic SDK 의존은 task-005에서 추가된다.
-// 임베딩 타입·팩토리(EmbeddingClient/InitEmbeddings/Embed/EmbedQuery)는 Phase 3 범위다.
+// message, tool, structured, core에 의존한다. 챗은 Anthropic·OpenAI 공식 SDK 어댑터,
+// 임베딩(EmbeddingClient/InitEmbeddings)은 Ollama(net/http)·OpenAI(SDK) 구현체를 제공한다.
 package llm
 
 import (
