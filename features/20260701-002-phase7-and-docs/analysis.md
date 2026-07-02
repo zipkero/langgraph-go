@@ -189,11 +189,19 @@ go.mod: pgx·pgvector-go 신규 require(§5 D1). Tavily는 REST 직접이라 req
   아니다. 통합 테스트는 스키마가 준비된 크리덴셜 환경에서만 실행(없으면 skip). 이 가정은 승인 전 확인 항목으로 올려
   두었다.
 
-### D3 — Google Drive 인증 취급 (SPEC §5.3)
+### D3 — Google Drive 인증 취급 및 SDK 도입 (SPEC §5.3)
 - **채택: OAuth 파일 경로 주입.** `credentials.json`/`token.json` 경로를 `storage` 생성 인자/옵션으로 받고
   `Initialize`가 토큰을 로드·리프레시한다. 경로는 하드코딩하지 않고 호출자가 주입한다(config가 아닌 storage 생성
   인자 — config leaf 유지, env 아님). 근거 — README §24가 "env가 아닌 파일 경로 설정"으로 명시. 통합 테스트는 인증
   파일 부재 시 skip.
+- **채택: Google Drive SDK(`google.golang.org/api/drive/v3`) 도입 + a2a 전역 정책 완화.** 구현 중
+  `a2a/import_boundary_test.go`가 go.mod 전체 텍스트를 스캔해 `google.golang.org/api`·`grpc`·`protobuf`를 금지
+  ("SDK/gRPC 미추가"라는 a2a feature 당시 사용자 결정 보호)함이 확인됐다. Drive SDK는 이 세 모듈을 전이 의존으로
+  끌어와 정책과 충돌한다. 사용자 결정으로 그 기존 정책을 재개정해 **Drive SDK 도입을 허용**한다. 이에 따라 a2a의
+  go.mod 전역 금지 스캔은 a2a **자기 의존 트리** 검사로 좁힌다(a2a 자신은 여전히 이 모듈들을 쓰지 않음을 보장하되,
+  storage 등 무관 패키지가 go.mod에 추가하는 것은 허용). 이는 요구사항(정책) 변경에 따른 테스트 단정 대상 갱신이며,
+  §1.5의 vectorstore 경계 테스트 갱신과 동일 성격이다(공개 API 변경 아님). 대안(REST 직접 호출로 SDK 회피)은
+  기각됐다.
 
 ### D4 — SupabaseVectorStore 계약 범위와 질의 임베딩 소유 (SPEC §5.5)
 - **채택: `Retriever` 계약을 충족하고 질의 임베딩을 위해 `llm.EmbeddingClient`를 보유.**

@@ -7,6 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
+	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -21,6 +24,8 @@ type Transport string
 const (
 	// TransportStdio 는 stdio 기반 전송을 나타낸다.
 	TransportStdio Transport = "stdio"
+	// TransportStreamableHTTP 는 MCP streamable HTTP 전송을 나타낸다.
+	TransportStreamableHTTP Transport = "streamable_http"
 )
 
 // ServerConfig 는 MCP 서버 연결 설정을 담는다.
@@ -121,6 +126,43 @@ func (s *Server) RegisterPrompt(name string, msgs []message.Message) error {
 // ServeStdio 는 stdio 전송으로 MCP 서버를 시작한다. ctx가 취소되거나 stdin이 닫힐 때까지 블로킹한다.
 func (s *Server) ServeStdio(ctx context.Context) error {
 	return s.sdkServer.Run(ctx, &sdkmcp.StdioTransport{})
+}
+
+// streamableHTTPHandler 는 이 서버가 등록한 도구·프롬프트를 streamable HTTP로 노출하는
+// http.Handler를 생성한다. getServer는 항상 같은 *sdkmcp.Server를 반환해 세션마다 동일한
+// 등록물(RegisterTool/RegisterPrompt)을 공유한다.
+func (s *Server) streamableHTTPHandler() http.Handler {
+	return sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server {
+		return s.sdkServer
+	}, nil)
+}
+
+// ServeStreamableHTTP 는 addr(host:port)에서 MCP streamable HTTP 서버를 시작한다.
+// RegisterTool/RegisterPrompt로 등록된 도구·프롬프트를 동일한 *mcp.Server 공유로 노출한다.
+// ctx가 취소되면 서버를 graceful shutdown한다(a2a Server.Run 패턴 참조).
+func (s *Server) ServeStreamableHTTP(ctx context.Context, addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("mcp: 리스너 생성 실패: %w", err)
+	}
+
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: s.streamableHTTPHandler(),
+	}
+
+	// ctx 취소 시 서버를 graceful shutdown한다.
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("mcp: HTTP 서버 기동 실패: %w", err)
+	}
+	return nil
 }
 
 // toolSchemaToInputSchema 는 tool.Schema의 Parameters를 JSON Schema(map[string]any)로 변환한다.

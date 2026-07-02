@@ -6,8 +6,22 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 )
+
+// mcpServerEnvPrefix / mcpServerEnvSuffixes 는 LoadMCPServers가 스캔하는 환경변수 명명 규칙이다.
+// 형식: MCP_SERVER_<NAME>_<SUFFIX> (예: MCP_SERVER_RAG_URL). <NAME>은 라이브러리가 고정하지 않고
+// 존재하는 환경변수에서 동적으로 발견한다(README §24: 특정 이름을 고정하지 않음).
+const mcpServerEnvPrefix = "MCP_SERVER_"
+
+var mcpServerEnvSuffixes = []string{"_TRANSPORT", "_COMMAND", "_ARGS", "_URL"}
+
+// agentEnvPrefix 는 AgentURLs/GetAgentConfig가 스캔하는 환경변수 명명 규칙의 접두사다.
+// 형식: AGENT_<NAME>_<SUFFIX> (예: AGENT_RAG_URL). 필수 환경변수가 아니라 기본값(빈 값)이 있는
+// 선택적 오버라이드이며, `.env.example`에는 선언하지 않는다(README §24).
+const agentEnvPrefix = "AGENT_"
 
 // Config 는 애플리케이션 실행에 필요한 자격증명과 설정을 담는다.
 // 챗은 Anthropic(Claude), 임베딩은 OpenAI를 사용하므로 두 키를 모두 보관한다.
@@ -132,4 +146,111 @@ func GetConfigurable(cfg RunConfig, key string) (any, bool) {
 	}
 	v, ok := cfg.Configurable[key]
 	return v, ok
+}
+
+// LoadMCPServers 는 프로세스 환경변수에서 MCP_SERVER_<NAME>_* 형식의 값을 스캔해
+// 이름별 ServerConfig 맵을 조립한다. <NAME>은 고정하지 않고 존재하는 환경변수만큼 동적으로
+// 발견하며(예: MCP_SERVER_RAG_URL), 반환 타입은 config 자체 타입(ServerConfig)이라
+// config는 mcp 등 상위 패키지를 import하지 않는 leaf로 유지된다(SPEC §5.4, ANALYSIS §1.4).
+func LoadMCPServers() map[string]ServerConfig {
+	names := discoverEnvNames(mcpServerEnvPrefix, mcpServerEnvSuffixes)
+	servers := make(map[string]ServerConfig, len(names))
+	for _, name := range names {
+		upper := strings.ToUpper(name)
+		servers[name] = ServerConfig{
+			Transport: os.Getenv(mcpServerEnvPrefix + upper + "_TRANSPORT"),
+			Command:   os.Getenv(mcpServerEnvPrefix + upper + "_COMMAND"),
+			Args:      splitEnvList(os.Getenv(mcpServerEnvPrefix + upper + "_ARGS")),
+			URL:       os.Getenv(mcpServerEnvPrefix + upper + "_URL"),
+		}
+	}
+	return servers
+}
+
+// AgentURLs 는 프로세스 환경변수에서 AGENT_<NAME>_URL 형식의 값을 스캔해 이름→URL 맵을 조립한다.
+// <NAME>은 라이브러리가 고정하지 않으며(RAG/WEB/FILE 등은 다운스트림 예시일 뿐), 필수 환경변수가 아닌
+// 기본값 있는 선택적 오버라이드다(README §24).
+func AgentURLs() map[string]string {
+	names := discoverEnvNames(agentEnvPrefix, []string{"_URL"})
+	urls := make(map[string]string, len(names))
+	for _, name := range names {
+		urls[name] = os.Getenv(agentEnvPrefix + strings.ToUpper(name) + "_URL")
+	}
+	return urls
+}
+
+// GetAgentConfig 는 name(대소문자 무관)에 대응하는 AGENT_<NAME>_URL/PORT/DESCRIPTION 환경변수로
+// AgentConfig를 조립해 반환한다. URL이 설정돼 있지 않으면 에러를 반환한다.
+func GetAgentConfig(name string) (AgentConfig, error) {
+	upper := strings.ToUpper(name)
+	url := os.Getenv(agentEnvPrefix + upper + "_URL")
+	if url == "" {
+		return AgentConfig{}, fmt.Errorf("config: 에이전트 설정을 찾을 수 없습니다: %s (%s%s_URL 미설정)",
+			name, agentEnvPrefix, upper)
+	}
+	port := 0
+	if raw := os.Getenv(agentEnvPrefix + upper + "_PORT"); raw != "" {
+		if p, err := strconv.Atoi(raw); err == nil {
+			port = p
+		}
+	}
+	return AgentConfig{
+		Name:        name,
+		URL:         url,
+		Port:        port,
+		Description: os.Getenv(agentEnvPrefix + upper + "_DESCRIPTION"),
+	}, nil
+}
+
+// discoverEnvNames 는 os.Environ()을 스캔해 "<prefix><NAME><suffix>" 형식의 키에서
+// <NAME>을 추출한다(임의 suffix 중 하나라도 매치하면 채택). 중복 없이 소문자로 정규화해
+// 정렬된 순서로 반환한다.
+func discoverEnvNames(prefix string, suffixes []string) []string {
+	seen := map[string]bool{}
+	for _, kv := range os.Environ() {
+		idx := strings.IndexByte(kv, '=')
+		if idx < 0 {
+			continue
+		}
+		key := kv[:idx]
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(key, prefix)
+		for _, suffix := range suffixes {
+			if strings.HasSuffix(rest, suffix) {
+				name := strings.TrimSuffix(rest, suffix)
+				if name != "" {
+					seen[strings.ToLower(name)] = true
+				}
+				break
+			}
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// splitEnvList 는 콤마로 구분된 환경변수 값을 공백 트리밍 후 슬라이스로 분리한다.
+// 빈 문자열이면 nil을 반환하고, 빈 항목은 건너뛴다.
+func splitEnvList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }

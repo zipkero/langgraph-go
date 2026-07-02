@@ -49,6 +49,13 @@ func (c *Client) Connect(ctx context.Context) error {
 		transport = &sdkmcp.CommandTransport{
 			Command: exec.Command(c.cfg.Command, c.cfg.Args...),
 		}
+	case TransportStreamableHTTP:
+		if c.cfg.URL == "" {
+			return fmt.Errorf("mcp: streamable_http 전송에는 URL이 필요합니다")
+		}
+		transport = &sdkmcp.StreamableClientTransport{
+			Endpoint: c.cfg.URL,
+		}
 	default:
 		return fmt.Errorf("mcp: 지원하지 않는 전송 종류: %q", c.cfg.Transport)
 	}

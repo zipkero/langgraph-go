@@ -2,15 +2,16 @@
 // SPEC §5.8, §5.1:
 //   - a2a 는 agent·config·structured·message·tool·core 와 표준 라이브러리만 import하고,
 //     gRPC/protobuf·외부 a2a SDK(google.golang.org/grpc, google.golang.org/protobuf,
-//     a2aproject/a2a-go 등)가 의존 그래프에 없다.
+//     a2aproject/a2a-go 등)가 a2a 자신의 의존 그래프에 없다.
 //   - 하위 패키지(특히 agent·config·structured·message·tool·core)가 a2a 를 역참조하지 않는다.
 //   - Phase 0~6 패키지의 기존 동작은 수정되지 않는다.
 //
 // go/build 로 모듈 내부 소스를 정적 파싱한다. 런타임에 `go list` 같은 하위 프로세스를 띄우지 않으므로
 // 빌드 캐시 잠금·안티바이러스 행위탐지(temp 실행파일이 자식 프로세스 spawn)로 인한 비정상 종료가 없다.
-// 금지 외부 의존(gRPC/protobuf/외부 a2a SDK)은 두 층위로 검사한다:
-//   (a) 모듈 내부 패키지가 그 경로를 직접 import하는지(소스 정적 스캔),
-//   (b) go.mod require 에 해당 모듈이 등록돼 있는지(매니페스트 스캔, 사용자 결정 보호).
+// 금지 외부 의존(gRPC/protobuf/외부 a2a SDK) 검사는 a2a 자신의 전이 의존(collectDeps 가 수집하는 external)
+// 범위로 국한한다. go.mod 전체를 스캔하는 매니페스트 검사는 두지 않는다 — storage 등 무관 패키지가 자신의
+// 필요로 google.golang.org/api 계열을 go.mod 에 추가하는 것은 이 경계와 무관하다(phase7-and-docs task-003,
+// 사용자 결정: Drive SDK 유지 + a2a 정책 완화로 개정됨. 과거 "SDK/gRPC 미추가"는 a2a 자신에 한정된 결정이었다).
 package a2a_test
 
 import (
@@ -100,8 +101,7 @@ func collectDeps(t *testing.T, root, startPkg string) (internal, external map[st
 // 검사 항목:
 //  1. a2a 의 모듈 내부 의존이 허용 집합(agent·config·structured·message·tool·core 및 그 전이 의존) 안에 있다.
 //  2. a2a 의 전이 의존(모듈 내부 패키지가 직접 import하는 외부 경로)에 gRPC·protobuf·외부 a2a SDK 가 없다.
-//  3. go.mod require 에 gRPC·protobuf·외부 a2a SDK 모듈이 등록돼 있지 않다(사용자 결정: SDK/gRPC 미추가).
-//  4. 하위 패키지(agent·config·structured·message·tool·core)의 전이 의존에 a2a 가 없다(역참조 금지).
+//  3. 하위 패키지(agent·config·structured·message·tool·core)의 전이 의존에 a2a 가 없다(역참조 금지).
 func TestImportBoundary(t *testing.T) {
 	root := moduleRoot(t)
 	a2aPkg := modPrefix + "/a2a"
@@ -138,20 +138,6 @@ func TestImportBoundary(t *testing.T) {
 					t.Errorf("위반: %s 의존 목록에 금지된 외부 패키지 %s 가 포함돼 있습니다(SPEC §5.8)",
 						a2aPkg, d)
 				}
-			}
-		}
-	})
-
-	t.Run("go_mod_에_금지모듈_미등록", func(t *testing.T) {
-		data, err := os.ReadFile(filepath.Join(root, "go.mod"))
-		if err != nil {
-			t.Fatalf("go.mod 읽기 실패: %v", err)
-		}
-		content := string(data)
-		for _, prefix := range forbiddenPrefixes {
-			if strings.Contains(content, prefix) {
-				t.Errorf("위반: go.mod 에 금지된 모듈 %s 가 등록돼 있습니다(SPEC §3, 사용자 결정: SDK/gRPC 미추가)",
-					prefix)
 			}
 		}
 	})

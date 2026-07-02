@@ -1,134 +1,172 @@
-// import_boundary_test.go 는 task-008 검증 조건 중 패키지 import 경계를 회귀 보호하는 테스트를 담는다.
-// SPEC §5.9:
-//   - vectorstore 는 document·llm·tool 을 import 하고, database·외부 벡터 백엔드(Chroma/Supabase 등)를 import 하지 않는다.
-//   - document 는 모듈 내 상위 패키지(llm/tool/graph/vectorstore 등)를 import 하지 않는다.
+// import_boundary_test.go 는 task-006 검증 조건 중 패키지 import 경계를 회귀 보호하는 테스트다.
+// SPEC §5.5, ANALYSIS §1.5:
+//   - vectorstore 는 document·llm·tool·database 를 import하고, Chroma/Supabase 등 외부 벡터 백엔드 SDK는
+//     import하지 않는다.
+//   - database 는 vectorstore 를 역참조하지 않는다(vectorstore→database 단방향).
+//   - document 는 모듈 내 상위 패키지(llm/tool/graph/vectorstore/database 등)를 import하지 않는다.
 //
-// graph/import_boundary_test.go 와 동일한 go list -deps 방식을 따른다.
+// go/build 로 모듈 내부 소스를 정적 파싱한다. 런타임에 go list 같은 하위 프로세스를 띄우지 않으므로
+// 빌드 캐시 잠금·안티바이러스 행위탐지(temp 실행파일이 자식 프로세스 spawn)로 인한 비정상 종료(exit 259)가 없다
+// (database/import_boundary_test.go 와 동일 패턴). 이전에는 go list -deps 서브프로세스 방식이었으나,
+// database import 허용으로의 요구사항 변경(ANALYSIS §1.5)에 맞춰 정적 파싱 방식으로 전환했다.
 package vectorstore_test
 
 import (
-	"bytes"
-	"os/exec"
+	"go/build"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-const modulePath = "github.com/zipkero/langgraph-go"
+const vsModPrefix = "github.com/zipkero/langgraph-go"
 
-// depsOfPkg 는 pkg 의 전이적 의존 패키지 목록을 반환한다.
-// go list -deps 를 실행해 결과 줄을 슬라이스로 돌려준다.
-func depsOfPkg(t *testing.T, pkg string) []string {
+// vsModuleRoot 는 작업 디렉터리에서 위로 올라가며 go.mod 가 있는 모듈 루트를 찾는다.
+func vsModuleRoot(t *testing.T) string {
 	t.Helper()
-	cmd := exec.Command("go", "list", "-deps", pkg)
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("go list -deps %s 실패: %v\n출력: %s", pkg, err, out.String())
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("작업 디렉터리 조회 실패: %v", err)
 	}
-	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	result := make([]string, 0, len(lines))
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if l != "" {
-			result = append(result, l)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("go.mod 를 찾지 못했습니다")
+		}
+		dir = parent
+	}
+}
+
+// vsPkgDir 는 모듈 내부 import 경로를 디스크 디렉터리로 변환한다.
+func vsPkgDir(root, importPath string) string {
+	rel := strings.TrimPrefix(importPath, vsModPrefix)
+	rel = strings.TrimPrefix(rel, "/")
+	return filepath.Join(root, filepath.FromSlash(rel))
+}
+
+// vsIsInternal 은 import 경로가 이 모듈 내부 패키지인지 판별한다.
+func vsIsInternal(importPath string) bool {
+	return importPath == vsModPrefix || strings.HasPrefix(importPath, vsModPrefix+"/")
+}
+
+// vsCollectDeps 는 startPkg 의 전이적 의존을 정적 파싱으로 수집한다.
+// 모듈 내부 패키지만 재귀로 내려가며(외부 패키지는 import 문자열만 기록), 빌드 import만 본다(test import 제외).
+func vsCollectDeps(t *testing.T, root, startPkg string) (internal, external map[string]bool) {
+	t.Helper()
+	internal = map[string]bool{}
+	external = map[string]bool{}
+
+	var walk func(pkgPath string)
+	walk = func(pkgPath string) {
+		if internal[pkgPath] {
+			return
+		}
+		internal[pkgPath] = true
+
+		bp, err := build.ImportDir(vsPkgDir(root, pkgPath), 0)
+		if err != nil {
+			t.Fatalf("%s 정적 파싱 실패: %v", pkgPath, err)
+		}
+		for _, imp := range bp.Imports {
+			if vsIsInternal(imp) {
+				walk(imp)
+			} else {
+				external[imp] = true
+			}
 		}
 	}
-	return result
+	walk(startPkg)
+	return internal, external
 }
 
-// hasDep 는 deps 목록에 target 이 포함되는지 반환한다.
-func hasDep(deps []string, target string) bool {
-	for _, d := range deps {
-		if d == target {
-			return true
+// TestImportBoundary_vectorstore 는 vectorstore 패키지의 import 경계 규칙을 정적 분석으로
+// 단정하는 회귀 테스트다(SPEC §5.5, ANALYSIS §1.5).
+//
+// 검사 항목:
+//  1. vectorstore 의 모듈 내부 의존에 document·llm·tool·database 가 포함된다.
+//  2. vectorstore 의 전이 의존(외부 패키지)에 Chroma/Supabase 등 금지된 외부 벡터 백엔드 SDK가 없다.
+//  3. database 의 모듈 내부 의존에 vectorstore 가 없다(역참조 금지, 단방향 보장).
+func TestImportBoundary_vectorstore(t *testing.T) {
+	root := vsModuleRoot(t)
+	vsPkg := vsModPrefix + "/vectorstore"
+
+	internal, external := vsCollectDeps(t, root, vsPkg)
+
+	t.Run("vectorstore는_document를_import한다", func(t *testing.T) {
+		if !internal[vsModPrefix+"/document"] {
+			t.Errorf("위반: %s 의 의존 목록에 %s 가 없습니다(SPEC §5.5)", vsPkg, vsModPrefix+"/document")
 		}
-	}
-	return false
-}
+	})
 
-// TestImportBoundary_vectorstore는_document를_import한다 는 vectorstore 의 의존 목록에
-// document 패키지가 포함됨을 검증한다(SPEC §5.9).
-func TestImportBoundary_vectorstore는_document를_import한다(t *testing.T) {
-	vsPkg := modulePath + "/vectorstore"
-	docPkg := modulePath + "/document"
-
-	deps := depsOfPkg(t, vsPkg)
-	if !hasDep(deps, docPkg) {
-		t.Errorf("위반: %s 의존 목록에 %s 가 없습니다(SPEC §5.9)", vsPkg, docPkg)
-	}
-}
-
-// TestImportBoundary_vectorstore는_llm을_import한다 는 vectorstore 의 의존 목록에
-// llm 패키지가 포함됨을 검증한다(SPEC §5.9).
-func TestImportBoundary_vectorstore는_llm을_import한다(t *testing.T) {
-	vsPkg := modulePath + "/vectorstore"
-	llmPkg := modulePath + "/llm"
-
-	deps := depsOfPkg(t, vsPkg)
-	if !hasDep(deps, llmPkg) {
-		t.Errorf("위반: %s 의존 목록에 %s 가 없습니다(SPEC §5.9)", vsPkg, llmPkg)
-	}
-}
-
-// TestImportBoundary_vectorstore는_tool을_import한다 는 vectorstore 의 의존 목록에
-// tool 패키지가 포함됨을 검증한다(SPEC §5.9).
-func TestImportBoundary_vectorstore는_tool을_import한다(t *testing.T) {
-	vsPkg := modulePath + "/vectorstore"
-	toolPkg := modulePath + "/tool"
-
-	deps := depsOfPkg(t, vsPkg)
-	if !hasDep(deps, toolPkg) {
-		t.Errorf("위반: %s 의존 목록에 %s 가 없습니다(SPEC §5.9)", vsPkg, toolPkg)
-	}
-}
-
-// TestImportBoundary_vectorstore는_금지_패키지를_import하지_않는다 는 vectorstore 의 의존 목록에
-// database 및 외부 벡터 백엔드(Chroma/Supabase 등) 관련 패키지가 없음을 검증한다(SPEC §5.9).
-func TestImportBoundary_vectorstore는_금지_패키지를_import하지_않는다(t *testing.T) {
-	vsPkg := modulePath + "/vectorstore"
-
-	deps := depsOfPkg(t, vsPkg)
-
-	// 금지 대상: 모듈 내 database 패키지 및 외부 벡터 백엔드 경로
-	forbidden := []string{
-		modulePath + "/database",
-		"github.com/amikos-tech/chroma-go",
-		"github.com/supabase-community/supabase-go",
-	}
-	for _, f := range forbidden {
-		if hasDep(deps, f) {
-			t.Errorf("위반: %s 의존 목록에 허용되지 않은 패키지 %s 가 포함돼 있습니다(SPEC §5.9)", vsPkg, f)
+	t.Run("vectorstore는_llm을_import한다", func(t *testing.T) {
+		if !internal[vsModPrefix+"/llm"] {
+			t.Errorf("위반: %s 의 의존 목록에 %s 가 없습니다(SPEC §5.5)", vsPkg, vsModPrefix+"/llm")
 		}
-	}
+	})
+
+	t.Run("vectorstore는_tool을_import한다", func(t *testing.T) {
+		if !internal[vsModPrefix+"/tool"] {
+			t.Errorf("위반: %s 의 의존 목록에 %s 가 없습니다(SPEC §5.5)", vsPkg, vsModPrefix+"/tool")
+		}
+	})
+
+	t.Run("vectorstore는_database를_import한다", func(t *testing.T) {
+		if !internal[vsModPrefix+"/database"] {
+			t.Errorf("위반: %s 의 의존 목록에 %s 가 없습니다(SPEC §5.5, ANALYSIS §1.5)", vsPkg, vsModPrefix+"/database")
+		}
+	})
+
+	t.Run("vectorstore는_금지된_외부벡터백엔드SDK를_import하지_않는다", func(t *testing.T) {
+		forbidden := []string{
+			"github.com/amikos-tech/chroma-go",
+			"github.com/supabase-community/supabase-go",
+		}
+		for _, f := range forbidden {
+			if external[f] {
+				t.Errorf("위반: %s 의 의존 목록에 허용되지 않은 패키지 %s 가 포함돼 있습니다(SPEC §5.5)", vsPkg, f)
+			}
+		}
+	})
+
+	t.Run("database는_vectorstore를_역참조하지_않는다", func(t *testing.T) {
+		dbInternal, _ := vsCollectDeps(t, root, vsModPrefix+"/database")
+		if dbInternal[vsPkg] {
+			t.Errorf("위반: %s 의 의존 목록에 %s 가 포함돼 있습니다(역참조 금지, SPEC §5.5)", vsModPrefix+"/database", vsPkg)
+		}
+	})
 }
 
 // TestImportBoundary_document는_상위_패키지를_import하지_않는다 는 document 의 의존 목록에
-// 모듈 내 상위 패키지(llm/tool/graph/vectorstore 등)가 없음을 검증한다(SPEC §5.9).
+// 모듈 내 상위 패키지(llm/tool/graph/vectorstore/database 등)가 없음을 검증한다(SPEC §5.9).
 func TestImportBoundary_document는_상위_패키지를_import하지_않는다(t *testing.T) {
-	docPkg := modulePath + "/document"
+	root := vsModuleRoot(t)
+	docPkg := vsModPrefix + "/document"
 
-	deps := depsOfPkg(t, docPkg)
+	internal, _ := vsCollectDeps(t, root, docPkg)
 
 	// document 가 import 해서는 안 되는 모듈 내 상위 패키지 목록
 	forbidden := []string{
-		modulePath + "/llm",
-		modulePath + "/tool",
-		modulePath + "/vectorstore",
-		modulePath + "/graph",
-		modulePath + "/graph/command",
-		modulePath + "/agent",
-		modulePath + "/prebuilt",
-		modulePath + "/middleware",
-		modulePath + "/checkpoint",
-		modulePath + "/streaming",
-		modulePath + "/structured",
-		modulePath + "/prompt",
-		modulePath + "/message",
+		vsModPrefix + "/llm",
+		vsModPrefix + "/tool",
+		vsModPrefix + "/vectorstore",
+		vsModPrefix + "/database",
+		vsModPrefix + "/graph",
+		vsModPrefix + "/graph/command",
+		vsModPrefix + "/agent",
+		vsModPrefix + "/prebuilt",
+		vsModPrefix + "/middleware",
+		vsModPrefix + "/checkpoint",
+		vsModPrefix + "/streaming",
+		vsModPrefix + "/structured",
+		vsModPrefix + "/prompt",
+		vsModPrefix + "/message",
 	}
 	for _, f := range forbidden {
-		if hasDep(deps, f) {
-			t.Errorf("위반: %s 의존 목록에 허용되지 않은 패키지 %s 가 포함돼 있습니다(SPEC §5.9)", docPkg, f)
+		if internal[f] {
+			t.Errorf("위반: %s 의 의존 목록에 허용되지 않은 패키지 %s 가 포함돼 있습니다(SPEC §5.9)", docPkg, f)
 		}
 	}
 }
